@@ -1,0 +1,1290 @@
+import pandas as pd
+import numpy as np
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader, TensorDataset
+from sklearn.preprocessing import MinMaxScaler, StandardScaler
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+import matplotlib.pyplot as plt
+import seaborn as sns
+from arch import arch_model
+import warnings
+import logging
+import os
+import json
+from datetime import datetime
+from typing import Dict, List, Tuple, Optional, Union
+from scipy import stats
+from statsmodels.stats.diagnostic import acorr_ljungbox
+from statsmodels.tsa.stattools import adfuller
+
+# Configure logging and warnings
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+warnings.filterwarnings('ignore')
+
+class GARCHDeepLearningForecaster:
+    """
+    Advanced GARCH-Deep Learning Hybrid Model for Cryptocurrency Forecasting
+    
+    This model combines:
+    1. GARCH models for volatility forecasting
+    2. LSTM/GRU networks enhanced with volatility features
+    3. Hybrid architectures that leverage both approaches
+    """
+    
+    def __init__(self, data_path: str, config: Optional[Dict] = None):
+        self.data_path = data_path
+        self.config = self._default_config()
+        if config:
+            self.config.update(config)
+            
+        self.df = None
+        self.df_enhanced = None
+        self.returns = None
+        self.price_scaler = MinMaxScaler()
+        self.volatility_scaler = StandardScaler()
+        self.feature_scaler = MinMaxScaler()
+        self.feature_names = None  # Store feature names manually
+        
+        # Models
+        self.garch_model = None
+        self.garch_fitted = None
+        self.deep_model = None
+        self.hybrid_model = None
+        
+        # Device setup
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        
+        # Output directory
+        self.output_dir = os.path.join(os.path.dirname(data_path), 'garch_dl_output')
+        os.makedirs(self.output_dir, exist_ok=True)
+        
+        logger.info(f"Initialized GARCH-Deep Learning Forecaster with device: {self.device}")
+    
+    def _default_config(self) -> Dict:
+        """Default configuration for the hybrid model"""
+        return {
+            # GARCH parameters
+            'garch_p': 1,
+            'garch_q': 1,
+            'garch_distribution': 'normal',  # 'normal', 't', 'skewt'
+            
+            # Deep learning parameters
+            'model_type': 'lstm',  # 'lstm', 'gru', 'hybrid'
+            'sequence_length': 30,
+            'hidden_size': 128,
+            'num_layers': 2,
+            'dropout': 0.2,
+            'batch_size': 32,
+            'learning_rate': 0.001,
+            'epochs': 150,
+            'patience': 25,
+            'weight_decay': 0.01,
+            'gradient_clip': 1.0,
+            
+            # Data parameters
+            'test_size': 0.2,
+            'validation_size': 0.1,
+            'min_periods': 100,
+            
+            # Hybrid model parameters
+            'use_garch_features': True,
+            'volatility_window': 20,
+            'garch_forecast_horizon': 1,
+            
+            # Advanced features
+            'use_regime_detection': True,
+            'use_risk_metrics': True,
+            'monte_carlo_simulations': 1000
+        }
+    
+    def load_and_preprocess_data(self) -> Optional[pd.DataFrame]:
+        """Load and preprocess cryptocurrency data"""
+        
+        logger.info(f"Loading data from: {self.data_path}")
+        
+        try:
+            # Try different separators
+            for sep in [';', ',', '\t', '|']:
+                try:
+                    self.df = pd.read_csv(self.data_path, sep=sep)
+                    if len(self.df.columns) > 1:
+                        break
+                except (pd.errors.EmptyDataError, pd.errors.ParserError):
+                    continue
+            else:
+                raise ValueError("Could not parse CSV with any common separator")
+                
+            if self.df.empty:
+                raise ValueError("Loaded DataFrame is empty")
+                
+            logger.info(f"Successfully loaded: {self.data_path}")
+            logger.info(f"   Shape: {self.df.shape}")
+            
+        except Exception as e:
+            logger.error(f"Error loading data: {str(e)}")
+            return None
+        
+        # Clean and standardize columns
+        self.df.columns = self.df.columns.str.strip().str.replace('"', '')
+        
+        # Column mapping
+        column_mapping = {
+            'timestamp': ['timeOpen', 'timestamp', 'date', 'time', 'Date', 'Time'],
+            'open': ['open', 'Open', 'OPEN'],
+            'high': ['high', 'High', 'HIGH'],
+            'low': ['low', 'Low', 'LOW'], 
+            'close': ['close', 'Close', 'CLOSE'],
+            'volume': ['volume', 'Volume', 'VOLUME', 'vol']
+        }
+        
+        for standard_name, possible_names in column_mapping.items():
+            for possible_name in possible_names:
+                if possible_name in self.df.columns:
+                    if standard_name != possible_name:
+                        self.df = self.df.rename(columns={possible_name: standard_name})
+                    break
+        
+        # Ensure required columns
+        required_cols = ['open', 'high', 'low', 'close']
+        missing_cols = [col for col in required_cols if col not in self.df.columns]
+        if missing_cols:
+            logger.error(f"Missing required columns: {missing_cols}")
+            return None
+        
+        # Parse timestamp if exists
+        if 'timestamp' in self.df.columns:
+            try:
+                # Get timestamp column safely
+                timestamp_col = self.df['timestamp']
+                if isinstance(timestamp_col, pd.DataFrame):
+                    timestamp_col = timestamp_col.iloc[:, 0]  # Take first column if DataFrame
+                
+                # Convert to string and clean
+                timestamp_series = timestamp_col.astype(str).str.replace('"', '')
+                
+                # Parse to datetime
+                parsed_timestamps = pd.to_datetime(timestamp_series, errors='coerce')
+                
+                # Create a new clean DataFrame to avoid indexing issues
+                new_df = self.df.copy()
+                new_df['timestamp'] = parsed_timestamps
+                
+                # Sort by timestamp
+                new_df = new_df.sort_values('timestamp').reset_index(drop=True)
+                self.df = new_df
+                
+            except Exception as e:
+                logger.warning(f"Could not parse timestamp column: {str(e)}")
+                logger.info("Creating synthetic timestamp column...")
+                
+                # Create a completely new DataFrame with synthetic timestamps
+                data_dict = {}
+                for col in self.df.columns:
+                    if col != 'timestamp':
+                        data_dict[col] = self.df[col].values
+                
+                # Add synthetic timestamp
+                data_dict['timestamp'] = pd.date_range(start='2020-01-01', periods=len(self.df), freq='D')
+                
+                # Create new DataFrame
+                self.df = pd.DataFrame(data_dict)
+        
+        # Convert to numeric
+        numeric_cols = ['open', 'high', 'low', 'close']
+        if 'volume' in self.df.columns:
+            numeric_cols.append('volume')
+            
+        for col in numeric_cols:
+            self.df[col] = pd.to_numeric(self.df[col], errors='coerce')
+        
+        # Clean data
+        self.df = self.df.dropna(subset=['open', 'high', 'low', 'close'])
+        
+        # Add volume if missing
+        if 'volume' not in self.df.columns:
+            self.df['volume'] = 1.0
+        else:
+            self.df['volume'] = self.df['volume'].fillna(1.0)
+        
+        # Calculate returns
+        self.df['returns'] = self.df['close'].pct_change()
+        self.df['log_returns'] = np.log(self.df['close'] / self.df['close'].shift())
+        
+        # Remove first row with NaN return
+        self.df = self.df.dropna().reset_index(drop=True)
+        
+        logger.info(f"Data preprocessed: {len(self.df)} rows")
+        if 'timestamp' in self.df.columns:
+            logger.info(f"   Date range: {self.df['timestamp'].min()} to {self.df['timestamp'].max()}")
+        logger.info(f"   Price range: ${self.df['close'].min():,.2f} - ${self.df['close'].max():,.2f}")
+        logger.info(f"   Return statistics: Mean={self.df['returns'].mean():.4f}, Std={self.df['returns'].std():.4f}")
+        
+        return self.df
+    
+    def test_stationarity(self, series: pd.Series, name: str = "Series") -> Dict:
+        """Test for stationarity using Augmented Dickey-Fuller test"""
+        
+        result = adfuller(series.dropna())
+        
+        stationarity_result = {
+            'adf_statistic': result[0],
+            'p_value': result[1],
+            'critical_values': result[4],
+            'is_stationary': result[1] < 0.05
+        }
+        
+        logger.info(f"Stationarity test for {name}:")
+        logger.info(f"   ADF Statistic: {result[0]:.4f}")
+        logger.info(f"   p-value: {result[1]:.4f}")
+        logger.info(f"   Is stationary: {result[1] < 0.05}")
+        
+        return stationarity_result
+    
+    def fit_garch_model(self, returns_series: Optional[pd.Series] = None) -> Dict:
+        """Fit GARCH model to returns series"""
+        
+        if returns_series is None:
+            returns_series = self.df['returns'].dropna() * 100  # Convert to percentage
+        
+        logger.info("Fitting GARCH model...")
+        
+        # Test stationarity
+        stationarity = self.test_stationarity(returns_series, "Returns")
+        
+        # Configure GARCH model
+        if self.config['garch_distribution'] == 't':
+            distribution = 't'
+        elif self.config['garch_distribution'] == 'skewt':
+            distribution = 'skewt'
+        else:
+            distribution = 'normal'
+        
+        # Fit GARCH model
+        self.garch_model = arch_model(
+            returns_series,
+            vol='GARCH',
+            p=self.config['garch_p'],
+            q=self.config['garch_q'],
+            dist=distribution
+        )
+        
+        try:
+            self.garch_fitted = self.garch_model.fit(disp='off', show_warning=False)
+            
+            logger.info("GARCH model fitted successfully")
+            logger.info(f"   Model: GARCH({self.config['garch_p']}, {self.config['garch_q']})")
+            logger.info(f"   Distribution: {self.config['garch_distribution']}")
+            logger.info(f"   Log-likelihood: {self.garch_fitted.loglikelihood:.2f}")
+            logger.info(f"   AIC: {self.garch_fitted.aic:.2f}")
+            logger.info(f"   BIC: {self.garch_fitted.bic:.2f}")
+            
+            # Extract volatility
+            volatility = self.garch_fitted.conditional_volatility
+            
+            # Diagnostic tests
+            diagnostics = self._garch_diagnostics(returns_series, volatility)
+            
+            return {
+                'fitted_model': self.garch_fitted,
+                'volatility': volatility,
+                'diagnostics': diagnostics,
+                'stationarity': stationarity
+            }
+            
+        except Exception as e:
+            logger.error(f"Error fitting GARCH model: {str(e)}")
+            return None
+    
+    def _garch_diagnostics(self, returns: pd.Series, volatility: pd.Series) -> Dict:
+        """Perform GARCH model diagnostics"""
+        
+        # Standardized residuals
+        std_residuals = returns / volatility
+        
+        # Ljung-Box test for serial correlation in squared standardized residuals
+        lb_test = acorr_ljungbox(std_residuals**2, lags=10, return_df=True)
+        
+        # Jarque-Bera test for normality
+        jb_stat, jb_pvalue = stats.jarque_bera(std_residuals)
+        
+        diagnostics = {
+            'ljung_box_pvalue': lb_test['lb_pvalue'].iloc[-1],
+            'jarque_bera_stat': jb_stat,
+            'jarque_bera_pvalue': jb_pvalue,
+            'std_residuals_mean': std_residuals.mean(),
+            'std_residuals_std': std_residuals.std(),
+            'arch_effect_removed': lb_test['lb_pvalue'].iloc[-1] > 0.05
+        }
+        
+        logger.info("GARCH Diagnostics:")
+        logger.info(f"   ARCH effect removed: {diagnostics['arch_effect_removed']}")
+        logger.info(f"   Standardized residuals mean: {diagnostics['std_residuals_mean']:.4f}")
+        logger.info(f"   Standardized residuals std: {diagnostics['std_residuals_std']:.4f}")
+        
+        return diagnostics
+    
+    def create_enhanced_features(self, include_garch: bool = True) -> pd.DataFrame:
+        """Create comprehensive features including GARCH-based volatility features"""
+        
+        logger.info("Creating enhanced features...")
+        
+        df = self.df.copy()
+        
+        # Price-based features
+        for window in [5, 10, 20, 50]:
+            df[f'sma_{window}'] = df['close'].rolling(window=window).mean()
+            df[f'ema_{window}'] = df['close'].ewm(span=window).mean()
+            df[f'price_ratio_{window}'] = df['close'] / df[f'sma_{window}']
+        
+        # Volatility features (rolling)
+        for window in [5, 10, 20, 30]:
+            df[f'rolling_vol_{window}'] = df['returns'].rolling(window=window).std()
+            df[f'rolling_range_{window}'] = (df['high'] - df['low']).rolling(window=window).mean()
+        
+        # Technical indicators
+        # RSI
+        def calculate_rsi(prices, window=14):
+            delta = prices.diff()
+            gain = (delta.where(delta > 0, 0)).rolling(window=window).mean()
+            loss = (-delta.where(delta < 0, 0)).rolling(window=window).mean()
+            rs = gain / loss
+            return 100 - (100 / (1 + rs))
+        
+        df['rsi'] = calculate_rsi(df['close'])
+        
+        # MACD
+        ema_12 = df['close'].ewm(span=12).mean()
+        ema_26 = df['close'].ewm(span=26).mean()
+        df['macd'] = ema_12 - ema_26
+        df['macd_signal'] = df['macd'].ewm(span=9).mean()
+        
+        # Bollinger Bands
+        bb_window = 20
+        bb_middle = df['close'].rolling(window=bb_window).mean()
+        bb_std = df['close'].rolling(window=bb_window).std()
+        df['bb_upper'] = bb_middle + (bb_std * 2)
+        df['bb_lower'] = bb_middle - (bb_std * 2)
+        df['bb_position'] = (df['close'] - df['bb_lower']) / (df['bb_upper'] - df['bb_lower'])
+        df['bb_width'] = (df['bb_upper'] - df['bb_lower']) / bb_middle
+        
+        # Volume features
+        if 'volume' in df.columns:
+            df['volume_sma'] = df['volume'].rolling(window=20).mean()
+            df['volume_ratio'] = df['volume'] / df['volume_sma']
+            df['price_volume'] = df['close'] * df['volume']
+            df['vwap'] = (df['price_volume'].rolling(window=20).sum() / 
+                         df['volume'].rolling(window=20).sum())
+        
+        # Lag features
+        for lag in [1, 2, 3, 5]:
+            df[f'return_lag_{lag}'] = df['returns'].shift(lag)
+            df[f'vol_lag_{lag}'] = df[f'rolling_vol_20'].shift(lag)
+        
+        # GARCH-based features
+        if include_garch and self.garch_fitted is not None:
+            logger.info("   Adding GARCH-based volatility features...")
+            
+            # Get GARCH volatility
+            garch_vol = self.garch_fitted.conditional_volatility / 100  # Convert back from percentage
+            
+            # Align with dataframe
+            vol_series = pd.Series(index=df.index, dtype=float)
+            vol_series.iloc[-len(garch_vol):] = garch_vol.values
+            
+            df['garch_volatility'] = vol_series
+            
+            # Volatility features
+            df['garch_vol_ma'] = df['garch_volatility'].rolling(window=5).mean()
+            df['vol_regime'] = (df['garch_volatility'] > df['garch_volatility'].rolling(window=30).mean()).astype(int)
+            df['vol_percentile'] = df['garch_volatility'].rolling(window=252).rank(pct=True)
+            
+            # Risk metrics
+            df['var_95'] = df['garch_volatility'] * stats.norm.ppf(0.05)  # 95% VaR
+            df['var_99'] = df['garch_volatility'] * stats.norm.ppf(0.01)  # 99% VaR
+            
+            # Volatility forecasts (1-step ahead)
+            try:
+                forecasts = self.garch_fitted.forecast(horizon=1)
+                forecast_vol = np.sqrt(forecasts.variance.iloc[-1, 0]) / 100
+                df.loc[df.index[-1], 'garch_forecast'] = forecast_vol
+                df['garch_forecast'] = df['garch_forecast'].ffill()
+            except:
+                logger.warning("Could not generate GARCH forecasts")
+        
+        # Market regime detection
+        if self.config['use_regime_detection']:
+            # Trend regime
+            df['trend_regime'] = np.where(df['close'] > df['sma_50'], 1, 0)
+            
+            # Volatility regime using quantiles
+            vol_quantiles = df['rolling_vol_20'].quantile([0.33, 0.67])
+            df['vol_regime_detailed'] = pd.cut(
+                df['rolling_vol_20'], 
+                bins=[-np.inf, vol_quantiles.iloc[0], vol_quantiles.iloc[1], np.inf], 
+                labels=[0, 1, 2]
+            ).astype(float)
+        
+        # Fill missing values
+        df = df.ffill().bfill().fillna(0)
+        df = df.replace([np.inf, -np.inf], np.nan).fillna(0)
+        
+        self.df_enhanced = df
+        logger.info(f"Enhanced features created: {len(df.columns)} total columns")
+        
+        return df
+    
+    def prepare_sequences(self, target_col: str = 'close', feature_cols: List[str] = None) -> Tuple[np.ndarray, np.ndarray, List[str]]:
+        """Prepare sequences for deep learning models"""
+        
+        seq_len = self.config['sequence_length']
+        logger.info(f"Preparing sequences with length: {seq_len}")
+        
+        if feature_cols is None:
+            # Select key features
+            feature_cols = [
+                'open', 'high', 'low', 'close', 'volume', 'returns',
+                'rsi', 'macd', 'bb_position', 'rolling_vol_20'
+            ]
+            
+            # Add GARCH features if available
+            if self.config['use_garch_features'] and 'garch_volatility' in self.df_enhanced.columns:
+                feature_cols.extend([
+                    'garch_volatility', 'vol_regime', 'vol_percentile', 'var_95'
+                ])
+            
+            # Add regime features if enabled
+            if self.config['use_regime_detection']:
+                feature_cols.extend(['trend_regime', 'vol_regime_detailed'])
+            
+        # Filter available features
+        available_features = [f for f in feature_cols if f in self.df_enhanced.columns]
+        logger.info(f"   Using {len(available_features)} features: {available_features[:10]}...")
+        
+        # Extract data
+        feature_data = self.df_enhanced[available_features].values.astype('float32')
+        target_data = self.df_enhanced[target_col].values.astype('float32')
+        
+        # Scale features
+        feature_data_scaled = self.feature_scaler.fit_transform(feature_data)
+        
+        # Store feature names for later use
+        self.feature_names = available_features
+        
+        # Scale target
+        target_data_scaled = self.price_scaler.fit_transform(target_data.reshape(-1, 1)).flatten()
+        
+        # Create sequences
+        X_seq, y_seq = [], []
+        
+        for i in range(seq_len, len(feature_data_scaled)):
+            X_seq.append(feature_data_scaled[i-seq_len:i])
+            y_seq.append(target_data_scaled[i])
+        
+        X_seq = np.array(X_seq, dtype=np.float32)
+        y_seq = np.array(y_seq, dtype=np.float32)
+        
+        logger.info(f"Sequences prepared: {len(X_seq)} samples")
+        logger.info(f"   Input shape: {X_seq.shape}")
+        logger.info(f"   Output shape: {y_seq.shape}")
+        
+        return X_seq, y_seq, available_features
+    
+    def create_deep_model(self, input_size: int, model_type: str = None) -> nn.Module:
+        """Create deep learning model (LSTM, GRU, or Hybrid)"""
+        
+        model_type = model_type or self.config['model_type']
+        
+        class GARCHEnhancedLSTM(nn.Module):
+            def __init__(self, input_size: int, hidden_size: int = 128, num_layers: int = 2, dropout: float = 0.2):
+                super(GARCHEnhancedLSTM, self).__init__()
+                
+                self.hidden_size = hidden_size
+                self.num_layers = num_layers
+                
+                # Main LSTM
+                self.lstm = nn.LSTM(
+                    input_size, hidden_size, num_layers,
+                    batch_first=True, dropout=dropout if num_layers > 1 else 0
+                )
+                
+                # Attention mechanism
+                self.attention = nn.MultiheadAttention(hidden_size, num_heads=4, dropout=dropout, batch_first=True)
+                
+                # Volatility-specific branch (if GARCH features are present)
+                self.vol_branch = nn.Sequential(
+                    nn.Linear(hidden_size, hidden_size // 2),
+                    nn.ReLU(),
+                    nn.Dropout(dropout),
+                    nn.Linear(hidden_size // 2, hidden_size // 4)
+                )
+                
+                # Main prediction branch
+                self.main_branch = nn.Sequential(
+                    nn.Linear(hidden_size, hidden_size // 2),
+                    nn.ReLU(),
+                    nn.Dropout(dropout),
+                    nn.Linear(hidden_size // 2, hidden_size // 4)
+                )
+                
+                # Final layers
+                self.final_layer = nn.Sequential(
+                    nn.Linear(hidden_size // 2, hidden_size // 4),  # Combined branches
+                    nn.ReLU(),
+                    nn.Dropout(dropout),
+                    nn.Linear(hidden_size // 4, 1)
+                )
+                
+                self.batch_norm = nn.BatchNorm1d(hidden_size)
+                
+            def forward(self, x):
+                batch_size = x.size(0)
+                
+                # LSTM forward pass
+                lstm_out, (h_n, c_n) = self.lstm(x)
+                
+                # Attention mechanism
+                attended_out, _ = self.attention(lstm_out, lstm_out, lstm_out)
+                
+                # Use last output
+                last_output = attended_out[:, -1, :]
+                
+                # Batch normalization
+                if batch_size > 1:
+                    last_output = self.batch_norm(last_output)
+                
+                # Dual branches for price and volatility
+                vol_features = self.vol_branch(last_output)
+                main_features = self.main_branch(last_output)
+                
+                # Combine branches
+                combined = torch.cat([vol_features, main_features], dim=1)
+                
+                # Final prediction
+                output = self.final_layer(combined)
+                
+                return output
+        
+        class GARCHEnhancedGRU(nn.Module):
+            def __init__(self, input_size: int, hidden_size: int = 128, num_layers: int = 2, dropout: float = 0.2):
+                super(GARCHEnhancedGRU, self).__init__()
+                
+                self.hidden_size = hidden_size
+                self.num_layers = num_layers
+                
+                # Main GRU
+                self.gru = nn.GRU(
+                    input_size, hidden_size, num_layers,
+                    batch_first=True, dropout=dropout if num_layers > 1 else 0
+                )
+                
+                # Feature extraction layers
+                self.feature_extractor = nn.Sequential(
+                    nn.Linear(hidden_size, hidden_size),
+                    nn.ReLU(),
+                    nn.Dropout(dropout),
+                    nn.Linear(hidden_size, hidden_size // 2),
+                    nn.ReLU(),
+                    nn.Dropout(dropout),
+                    nn.Linear(hidden_size // 2, 1)
+                )
+                
+                self.batch_norm = nn.BatchNorm1d(hidden_size)
+                
+            def forward(self, x):
+                batch_size = x.size(0)
+                
+                # GRU forward pass
+                gru_out, h_n = self.gru(x)
+                
+                # Use last output
+                last_output = gru_out[:, -1, :]
+                
+                # Batch normalization
+                if batch_size > 1:
+                    last_output = self.batch_norm(last_output)
+                
+                # Feature extraction and prediction
+                output = self.feature_extractor(last_output)
+                
+                return output
+        
+        class HybridGARCHModel(nn.Module):
+            def __init__(self, input_size: int, hidden_size: int = 128, num_layers: int = 2, dropout: float = 0.2):
+                super(HybridGARCHModel, self).__init__()
+                
+                # LSTM branch
+                self.lstm = nn.LSTM(
+                    input_size, hidden_size // 2, num_layers,
+                    batch_first=True, dropout=dropout if num_layers > 1 else 0
+                )
+                
+                # GRU branch
+                self.gru = nn.GRU(
+                    input_size, hidden_size // 2, num_layers,
+                    batch_first=True, dropout=dropout if num_layers > 1 else 0
+                )
+                
+                # Fusion layer
+                self.fusion = nn.Sequential(
+                    nn.Linear(hidden_size, hidden_size),
+                    nn.ReLU(),
+                    nn.Dropout(dropout),
+                    nn.Linear(hidden_size, hidden_size // 2),
+                    nn.ReLU(),
+                    nn.Dropout(dropout),
+                    nn.Linear(hidden_size // 2, 1)
+                )
+                
+                self.batch_norm = nn.BatchNorm1d(hidden_size)
+                
+            def forward(self, x):
+                batch_size = x.size(0)
+                
+                # LSTM branch
+                lstm_out, _ = self.lstm(x)
+                lstm_last = lstm_out[:, -1, :]
+                
+                # GRU branch
+                gru_out, _ = self.gru(x)
+                gru_last = gru_out[:, -1, :]
+                
+                # Combine branches
+                combined = torch.cat([lstm_last, gru_last], dim=1)
+                
+                # Batch normalization
+                if batch_size > 1:
+                    combined = self.batch_norm(combined)
+                
+                # Final prediction
+                output = self.fusion(combined)
+                
+                return output
+        
+        # Create model based on type
+        if model_type.lower() == 'lstm':
+            model = GARCHEnhancedLSTM(
+                input_size, 
+                self.config['hidden_size'], 
+                self.config['num_layers'], 
+                self.config['dropout']
+            )
+        elif model_type.lower() == 'gru':
+            model = GARCHEnhancedGRU(
+                input_size, 
+                self.config['hidden_size'], 
+                self.config['num_layers'], 
+                self.config['dropout']
+            )
+        elif model_type.lower() == 'hybrid':
+            model = HybridGARCHModel(
+                input_size, 
+                self.config['hidden_size'], 
+                self.config['num_layers'], 
+                self.config['dropout']
+            )
+        else:
+            raise ValueError(f"Unknown model type: {model_type}")
+        
+        logger.info(f"Created {model_type.upper()} model:")
+        logger.info(f"   Input size: {input_size}")
+        logger.info(f"   Hidden size: {self.config['hidden_size']}")
+        logger.info(f"   Layers: {self.config['num_layers']}")
+        logger.info(f"   Parameters: {sum(p.numel() for p in model.parameters()):,}")
+        
+        return model
+    
+    def train_deep_model(self, X_seq: np.ndarray, y_seq: np.ndarray) -> Dict:
+        """Train the deep learning model"""
+        
+        logger.info("Training GARCH-enhanced deep learning model...")
+        
+        # Split data
+        test_size = self.config['test_size']
+        val_size = self.config['validation_size']
+        
+        total_size = len(X_seq)
+        test_start = int(total_size * (1 - test_size))
+        val_start = int(test_start * (1 - val_size))
+        
+        X_train = X_seq[:val_start]
+        y_train = y_seq[:val_start]
+        X_val = X_seq[val_start:test_start]
+        y_val = y_seq[val_start:test_start]
+        X_test = X_seq[test_start:]
+        y_test = y_seq[test_start:]
+        
+        logger.info(f"   Train samples: {len(X_train)}")
+        logger.info(f"   Validation samples: {len(X_val)}")
+        logger.info(f"   Test samples: {len(X_test)}")
+        
+        # Convert to tensors
+        train_dataset = TensorDataset(
+            torch.tensor(X_train, dtype=torch.float32),
+            torch.tensor(y_train, dtype=torch.float32).unsqueeze(1)
+        )
+        val_dataset = TensorDataset(
+            torch.tensor(X_val, dtype=torch.float32),
+            torch.tensor(y_val, dtype=torch.float32).unsqueeze(1)
+        )
+        test_dataset = TensorDataset(
+            torch.tensor(X_test, dtype=torch.float32),
+            torch.tensor(y_test, dtype=torch.float32).unsqueeze(1)
+        )
+        
+        # Data loaders
+        train_loader = DataLoader(train_dataset, batch_size=self.config['batch_size'], shuffle=False)
+        val_loader = DataLoader(val_dataset, batch_size=self.config['batch_size'], shuffle=False)
+        test_loader = DataLoader(test_dataset, batch_size=self.config['batch_size'], shuffle=False)
+        
+        # Create model
+        input_size = X_seq.shape[2]
+        self.deep_model = self.create_deep_model(input_size).to(self.device)
+        
+        # Loss and optimizer
+        criterion = nn.MSELoss()
+        optimizer = torch.optim.AdamW(
+            self.deep_model.parameters(),
+            lr=self.config['learning_rate'],
+            weight_decay=self.config['weight_decay']
+        )
+        
+        # Scheduler
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, mode='min', patience=10, factor=0.5
+        )
+        
+        # Training loop
+        best_val_loss = float('inf')
+        patience_counter = 0
+        train_losses = []
+        val_losses = []
+        
+        for epoch in range(self.config['epochs']):
+            # Training phase
+            self.deep_model.train()
+            train_loss = 0
+            
+            for batch_x, batch_y in train_loader:
+                batch_x, batch_y = batch_x.to(self.device), batch_y.to(self.device)
+                
+                optimizer.zero_grad()
+                output = self.deep_model(batch_x)
+                loss = criterion(output, batch_y)
+                loss.backward()
+                
+                # Gradient clipping
+                torch.nn.utils.clip_grad_norm_(
+                    self.deep_model.parameters(), 
+                    max_norm=self.config['gradient_clip']
+                )
+                
+                optimizer.step()
+                train_loss += loss.item()
+            
+            # Validation phase
+            self.deep_model.eval()
+            val_loss = 0
+            with torch.no_grad():
+                for batch_x, batch_y in val_loader:
+                    batch_x, batch_y = batch_x.to(self.device), batch_y.to(self.device)
+                    output = self.deep_model(batch_x)
+                    val_loss += criterion(output, batch_y).item()
+            
+            avg_train_loss = train_loss / len(train_loader)
+            avg_val_loss = val_loss / len(val_loader)
+            
+            train_losses.append(avg_train_loss)
+            val_losses.append(avg_val_loss)
+            
+            scheduler.step(avg_val_loss)
+            
+            # Early stopping
+            if avg_val_loss < best_val_loss:
+                best_val_loss = avg_val_loss
+                patience_counter = 0
+                # Save best model
+                torch.save(self.deep_model.state_dict(), 
+                          os.path.join(self.output_dir, 'best_deep_model.pth'))
+            else:
+                patience_counter += 1
+            
+            # Print progress
+            if epoch % 20 == 0 or epoch == self.config['epochs'] - 1:
+                logger.info(f"   Epoch {epoch:3d}: Train Loss: {avg_train_loss:.6f}, Val Loss: {avg_val_loss:.6f}")
+            
+            # Early stopping check
+            if patience_counter >= self.config['patience']:
+                logger.info(f"Early stopping at epoch {epoch}")
+                break
+        
+        # Load best model
+        # Note: .pth files are binary PyTorch model files, not text files
+        # They cannot be opened with text editors - use torch.load() to read them
+        self.deep_model.load_state_dict(
+            torch.load(os.path.join(self.output_dir, 'best_deep_model.pth'), 
+                      map_location=self.device, weights_only=True)
+        )
+        
+        logger.info("Deep learning model training completed!")
+        
+        return {
+            'train_losses': train_losses,
+            'val_losses': val_losses,
+            'X_test': X_test,
+            'y_test': y_test,
+            'test_loader': test_loader,
+            'best_val_loss': best_val_loss
+        }
+    
+    def evaluate_model(self, training_results: Dict) -> Dict:
+        """Comprehensive model evaluation"""
+        
+        logger.info("\nEvaluating GARCH-enhanced model...")
+        
+        X_test = training_results['X_test']
+        y_test = training_results['y_test']
+        test_loader = training_results['test_loader']
+        
+        # Make predictions
+        self.deep_model.eval()
+        predictions = []
+        actuals = []
+        
+        with torch.no_grad():
+            for batch_x, batch_y in test_loader:
+                batch_x = batch_x.to(self.device)
+                pred = self.deep_model(batch_x)
+                predictions.extend(pred.cpu().numpy().flatten())
+                actuals.extend(batch_y.numpy().flatten())
+        
+        predictions = np.array(predictions)
+        actuals = np.array(actuals)
+        
+        # Inverse transform predictions
+        pred_original = self.price_scaler.inverse_transform(predictions.reshape(-1, 1)).flatten()
+        actual_original = self.price_scaler.inverse_transform(actuals.reshape(-1, 1)).flatten()
+        
+        # Calculate metrics
+        mae = mean_absolute_error(actual_original, pred_original)
+        rmse = np.sqrt(mean_squared_error(actual_original, pred_original))
+        r2 = r2_score(actual_original, pred_original)
+        mape = np.mean(np.abs((actual_original - pred_original) / actual_original)) * 100
+        
+        # Directional accuracy
+        actual_direction = np.diff(actual_original) > 0
+        pred_direction = np.diff(pred_original) > 0
+        directional_accuracy = np.mean(actual_direction == pred_direction)
+        
+        # Financial metrics
+        returns_actual = np.diff(actual_original) / actual_original[:-1]
+        returns_pred = np.diff(pred_original) / pred_original[:-1]
+        
+        # Sharpe ratio
+        if np.std(returns_pred) > 0:
+            sharpe_ratio = np.mean(returns_pred) / np.std(returns_pred) * np.sqrt(252)
+        else:
+            sharpe_ratio = 0
+        
+        # Maximum drawdown
+        cumulative_returns = np.cumprod(1 + returns_pred)
+        running_max = np.maximum.accumulate(cumulative_returns)
+        drawdown = (cumulative_returns - running_max) / running_max
+        max_drawdown = np.min(drawdown)
+        
+        logger.info(f"\nModel Performance:")
+        logger.info(f"   MAE:  ${mae:,.2f}")
+        logger.info(f"   RMSE: ${rmse:,.2f}")
+        logger.info(f"   R²:   {r2:.4f}")
+        logger.info(f"   MAPE: {mape:.2f}%")
+        logger.info(f"   Directional Accuracy: {directional_accuracy:.2%}")
+        logger.info(f"   Sharpe Ratio: {sharpe_ratio:.4f}")
+        logger.info(f"   Max Drawdown: {max_drawdown:.2%}")
+        
+        evaluation_results = {
+            'mae': mae,
+            'rmse': rmse,
+            'r2': r2,
+            'mape': mape,
+            'directional_accuracy': directional_accuracy,
+            'sharpe_ratio': sharpe_ratio,
+            'max_drawdown': max_drawdown,
+            'predictions': pred_original,
+            'actuals': actual_original,
+            'returns_pred': returns_pred,
+            'returns_actual': returns_actual
+        }
+        
+        # Plot results
+        self.plot_results(evaluation_results, training_results)
+        
+        return evaluation_results
+    
+    def plot_results(self, evaluation_results: Dict, training_results: Dict):
+        """Create comprehensive visualization plots"""
+        
+        fig, axes = plt.subplots(3, 3, figsize=(24, 18))
+        
+        # 1. Training losses
+        axes[0, 0].plot(training_results['train_losses'], label='Training Loss', alpha=0.8)
+        axes[0, 0].plot(training_results['val_losses'], label='Validation Loss', alpha=0.8)
+        axes[0, 0].set_title('Training Progress', fontsize=14, fontweight='bold')
+        axes[0, 0].set_xlabel('Epoch')
+        axes[0, 0].set_ylabel('Loss')
+        axes[0, 0].legend()
+        axes[0, 0].grid(True, alpha=0.3)
+        
+        # 2. Predictions vs Actuals
+        pred = evaluation_results['predictions']
+        actual = evaluation_results['actuals']
+        
+        axes[0, 1].scatter(actual, pred, alpha=0.6, s=20)
+        min_val, max_val = min(actual.min(), pred.min()), max(actual.max(), pred.max())
+        axes[0, 1].plot([min_val, max_val], [min_val, max_val], 'r--', lw=2)
+        axes[0, 1].set_title(f'Predictions vs Actuals (R² = {evaluation_results["r2"]:.4f})', 
+                            fontsize=14, fontweight='bold')
+        axes[0, 1].set_xlabel('Actual Price ($)')
+        axes[0, 1].set_ylabel('Predicted Price ($)')
+        axes[0, 1].grid(True, alpha=0.3)
+        
+        # 3. Time series comparison
+        plot_len = min(200, len(actual))
+        indices = range(len(actual) - plot_len, len(actual))
+        
+        axes[0, 2].plot(indices, actual[-plot_len:], label='Actual', linewidth=2)
+        axes[0, 2].plot(indices, pred[-plot_len:], label='Predicted', linewidth=2, alpha=0.8)
+        axes[0, 2].set_title(f'Price Comparison (Last {plot_len} points)', fontsize=14, fontweight='bold')
+        axes[0, 2].set_xlabel('Time Index')
+        axes[0, 2].set_ylabel('Price ($)')
+        axes[0, 2].legend()
+        axes[0, 2].grid(True, alpha=0.3)
+        
+        # 4. Residuals
+        residuals = actual - pred
+        axes[1, 0].scatter(pred, residuals, alpha=0.6, s=20)
+        axes[1, 0].axhline(y=0, color='red', linestyle='--')
+        axes[1, 0].set_title('Residuals vs Predictions', fontsize=14, fontweight='bold')
+        axes[1, 0].set_xlabel('Predicted Price ($)')
+        axes[1, 0].set_ylabel('Residuals ($)')
+        axes[1, 0].grid(True, alpha=0.3)
+        
+        # 5. GARCH volatility
+        if self.garch_fitted is not None:
+            garch_vol = self.garch_fitted.conditional_volatility
+            axes[1, 1].plot(garch_vol.index[-plot_len:], garch_vol.iloc[-plot_len:], 
+                           label='GARCH Volatility', color='red', linewidth=2)
+            axes[1, 1].set_title('GARCH Conditional Volatility', fontsize=14, fontweight='bold')
+            axes[1, 1].set_xlabel('Time')
+            axes[1, 1].set_ylabel('Volatility (%)')
+            axes[1, 1].legend()
+            axes[1, 1].grid(True, alpha=0.3)
+        else:
+            axes[1, 1].text(0.5, 0.5, 'GARCH model not fitted', 
+                           ha='center', va='center', transform=axes[1, 1].transAxes)
+        
+        # 6. Returns comparison
+        returns_actual = evaluation_results['returns_actual']
+        returns_pred = evaluation_results['returns_pred']
+        
+        axes[1, 2].scatter(returns_actual, returns_pred, alpha=0.6, s=20)
+        min_ret, max_ret = min(returns_actual.min(), returns_pred.min()), max(returns_actual.max(), returns_pred.max())
+        axes[1, 2].plot([min_ret, max_ret], [min_ret, max_ret], 'r--', lw=2)
+        axes[1, 2].set_title('Returns Comparison', fontsize=14, fontweight='bold')
+        axes[1, 2].set_xlabel('Actual Returns')
+        axes[1, 2].set_ylabel('Predicted Returns')
+        axes[1, 2].grid(True, alpha=0.3)
+        
+        # 7. Distribution of residuals
+        axes[2, 0].hist(residuals, bins=50, alpha=0.7, edgecolor='black')
+        axes[2, 0].axvline(x=0, color='red', linestyle='--')
+        axes[2, 0].set_title('Distribution of Residuals', fontsize=14, fontweight='bold')
+        axes[2, 0].set_xlabel('Residuals ($)')
+        axes[2, 0].set_ylabel('Frequency')
+        axes[2, 0].grid(True, alpha=0.3)
+        
+        # 8. Cumulative returns
+        cum_returns_actual = np.cumprod(1 + returns_actual)
+        cum_returns_pred = np.cumprod(1 + returns_pred)
+        
+        axes[2, 1].plot(cum_returns_actual, label='Actual Strategy', linewidth=2)
+        axes[2, 1].plot(cum_returns_pred, label='Predicted Strategy', linewidth=2)
+        axes[2, 1].set_title('Cumulative Returns Comparison', fontsize=14, fontweight='bold')
+        axes[2, 1].set_xlabel('Time')
+        axes[2, 1].set_ylabel('Cumulative Returns')
+        axes[2, 1].legend()
+        axes[2, 1].grid(True, alpha=0.3)
+        
+        # 9. Risk metrics
+        metrics_text = f"""
+        MAE: ${evaluation_results['mae']:,.2f}
+        RMSE: ${evaluation_results['rmse']:,.2f}
+        R²: {evaluation_results['r2']:.4f}
+        MAPE: {evaluation_results['mape']:.2f}%
+        Dir. Acc.: {evaluation_results['directional_accuracy']:.2%}
+        Sharpe: {evaluation_results['sharpe_ratio']:.4f}
+        Max DD: {evaluation_results['max_drawdown']:.2%}
+        """
+        
+        axes[2, 2].text(0.1, 0.9, metrics_text, transform=axes[2, 2].transAxes, 
+                       fontsize=12, verticalalignment='top', 
+                       bbox=dict(boxstyle='round', facecolor='lightblue', alpha=0.5))
+        axes[2, 2].set_title('Performance Metrics', fontsize=14, fontweight='bold')
+        axes[2, 2].axis('off')
+        
+        plt.tight_layout()
+        
+        # Save plot
+        plot_path = os.path.join(self.output_dir, 'garch_dl_analysis.png')
+        plt.savefig(plot_path, dpi=300, bbox_inches='tight')
+        plt.show()
+        
+        logger.info(f"Analysis plots saved to {plot_path}")
+    
+    def forecast_with_garch_uncertainty(self, n_steps: int = 10) -> Dict:
+        """Generate forecasts with GARCH-based uncertainty bands"""
+        
+        if self.deep_model is None or self.garch_fitted is None:
+            logger.error("Both deep learning and GARCH models must be trained!")
+            return None
+        
+        logger.info(f"Generating {n_steps}-step forecasts with uncertainty...")
+        
+        # Get GARCH volatility forecasts
+        garch_forecasts = self.garch_fitted.forecast(horizon=n_steps)
+        vol_forecasts = np.sqrt(garch_forecasts.variance.values[-1]) / 100
+        
+        # Get last sequence for deep learning model
+        last_sequence = self.df_enhanced.iloc[-self.config['sequence_length']:].copy()
+        
+        # Feature columns used in training (use stored feature names)
+        if self.feature_names is None:
+            logger.error("Feature names not found. Model may not be properly trained.")
+            return None
+            
+        feature_cols = self.feature_names
+        
+        predictions = []
+        uncertainty_bands = []
+        
+        for step in range(n_steps):
+            # Prepare current sequence
+            sequence_data = last_sequence[feature_cols].values.astype('float32')
+            sequence_scaled = self.feature_scaler.transform(sequence_data)
+            sequence_tensor = torch.tensor(sequence_scaled, dtype=torch.float32).unsqueeze(0).to(self.device)
+            
+            # Get deep learning prediction
+            self.deep_model.eval()
+            with torch.no_grad():
+                pred_scaled = self.deep_model(sequence_tensor).cpu().item()
+            
+            pred_original = self.price_scaler.inverse_transform([[pred_scaled]])[0, 0]
+            predictions.append(pred_original)
+            
+            # Calculate uncertainty using GARCH volatility
+            vol_forecast = vol_forecasts[step] if step < len(vol_forecasts) else vol_forecasts[-1]
+            
+            # 95% confidence interval using GARCH volatility
+            lower_bound = pred_original * (1 - 1.96 * vol_forecast)
+            upper_bound = pred_original * (1 + 1.96 * vol_forecast)
+            
+            uncertainty_bands.append((lower_bound, upper_bound))
+            
+            # Update sequence for next prediction (simplified)
+            # In practice, you'd want to update all technical indicators
+            new_row = last_sequence.iloc[-1:].copy()
+            new_row['close'] = pred_original
+            new_row['returns'] = (pred_original - last_sequence.iloc[-1]['close']) / last_sequence.iloc[-1]['close']
+            
+            # Simple technical indicator updates
+            if 'rsi' in new_row.columns:
+                new_row['rsi'] = last_sequence['rsi'].iloc[-1]  # Simplified
+            if 'garch_volatility' in new_row.columns:
+                new_row['garch_volatility'] = vol_forecast
+            
+            # Append new row and remove oldest
+            last_sequence = pd.concat([last_sequence.iloc[1:], new_row], ignore_index=True)
+        
+        logger.info(f"Forecasts generated")
+        logger.info(f"   Next step prediction: ${predictions[0]:,.2f}")
+        logger.info(f"   {n_steps}-step prediction: ${predictions[-1]:,.2f}")
+        
+        return {
+            'predictions': np.array(predictions),
+            'uncertainty_bands': uncertainty_bands,
+            'volatility_forecasts': vol_forecasts,
+            'confidence_level': 0.95
+        }
+    
+    def run_complete_analysis(self) -> Optional[Dict]:
+        """Run complete GARCH-Deep Learning analysis"""
+        
+        logger.info("Running Complete GARCH-Deep Learning Cryptocurrency Analysis")
+        logger.info("=" * 70)
+        
+        start_time = datetime.now()
+        
+        try:
+            # 1. Load and preprocess data
+            if self.load_and_preprocess_data() is None:
+                return None
+            
+            # 2. Fit GARCH model
+            garch_results = self.fit_garch_model()
+            if garch_results is None:
+                logger.warning("GARCH model fitting failed, continuing with deep learning only")
+                self.config['use_garch_features'] = False
+            
+            # 3. Create enhanced features
+            self.create_enhanced_features(include_garch=self.config['use_garch_features'])
+            
+            # 4. Prepare sequences
+            X_seq, y_seq, feature_names = self.prepare_sequences()
+            
+            # 5. Train deep learning model
+            training_results = self.train_deep_model(X_seq, y_seq)
+            
+            # 6. Evaluate model
+            evaluation_results = self.evaluate_model(training_results)
+            
+            # 7. Generate forecasts with uncertainty
+            forecast_results = None
+            if self.garch_fitted is not None:
+                forecast_results = self.forecast_with_garch_uncertainty(10)
+            
+            end_time = datetime.now()
+            duration = end_time - start_time
+            
+            logger.info("\nComplete analysis finished successfully!")
+            logger.info(f"   Total duration: {duration}")
+            logger.info(f"   Output directory: {self.output_dir}")
+            
+            final_results = {
+                'garch_results': garch_results,
+                'training_results': training_results,
+                'evaluation_results': evaluation_results,
+                'forecast_results': forecast_results,
+                'feature_names': feature_names,
+                'config': self.config,
+                'duration': str(duration)
+            }
+            
+            # Save results
+            self._save_results(final_results)
+            
+            return final_results
+            
+        except Exception as e:
+            logger.error(f"\nError in analysis: {str(e)}")
+            import traceback
+            logger.error(f"Full traceback:\n{traceback.format_exc()}")
+            return None
+    
+    def _save_results(self, results: Dict):
+        """Save analysis results to files"""
+        
+        # Convert numpy arrays and non-serializable objects
+        def convert_for_json(obj):
+            if isinstance(obj, np.ndarray):
+                return obj.tolist()
+            elif isinstance(obj, np.integer):
+                return int(obj)
+            elif isinstance(obj, np.floating):
+                return float(obj)
+            elif isinstance(obj, pd.Timestamp):
+                return str(obj)
+            elif isinstance(obj, dict):
+                return {key: convert_for_json(value) for key, value in obj.items()}
+            elif isinstance(obj, (list, tuple)):
+                return [convert_for_json(item) for item in obj]
+            else:
+                return obj
+        
+        # Save main results
+        results_path = os.path.join(self.output_dir, 'garch_dl_results.json')
+        with open(results_path, 'w') as f:
+            json_results = convert_for_json({
+                k: v for k, v in results.items() 
+                if k not in ['garch_results', 'training_results']  # Skip complex objects
+            })
+            json.dump(json_results, f, indent=2)
+        
+        # Save configuration
+        config_path = os.path.join(self.output_dir, 'config.json')
+        with open(config_path, 'w') as f:
+            json.dump(self.config, f, indent=2)
+        
+        logger.info(f"Results saved to {self.output_dir}")
+
+# Usage Example and Main Execution
+if __name__ == "__main__":
+    print("GARCH-Enhanced Deep Learning Cryptocurrency Forecasting")
+    print("=" * 70)
+    
+    # Configuration
+    config = {
+        # GARCH settings
+        'garch_p': 1,
+        'garch_q': 1,
+        'garch_distribution': 'normal',
+        
+        # Deep learning settings
+        'model_type': 'hybrid',  # 'lstm', 'gru', 'hybrid'
+        'sequence_length': 30,
+        'hidden_size': 128,
+        'num_layers': 3,
+        'dropout': 0.2,
+        'batch_size': 32,
+        'learning_rate': 0.0005,
+        'epochs': 100,
+        'patience': 20,
+        
+        # Feature settings
+        'use_garch_features': True,
+        'use_regime_detection': True,
+        'use_risk_metrics': True,
+        
+        # Forecast settings
+        'monte_carlo_simulations': 500
+    }
+    
+    # Initialize forecaster
+    forecaster = GARCHDeepLearningForecaster(
+        data_path="Bitcoin_12.2013_05.2025.csv",
+        config=config
+    )
+    
+    # Run complete analysis
+    results = forecaster.run_complete_analysis()
+    
+    if results:
+        print(f"\nFinal Results Summary:")
+        print(f"=" * 50)
+        
+        eval_results = results['evaluation_results']
+        print(f"Model Type: {config['model_type'].upper()}")
+        print(f"R² Score: {eval_results['r2']:.4f}")
+        print(f"MAPE: {eval_results['mape']:.2f}%")
+        print(f"Directional Accuracy: {eval_results['directional_accuracy']:.2%}")
+        print(f"Sharpe Ratio: {eval_results['sharpe_ratio']:.4f}")
+        print(f"Max Drawdown: {eval_results['max_drawdown']:.2%}")
+        
+        if results['forecast_results']:
+            forecast = results['forecast_results']
+            print(f"\n10-Step Forecasts:")
+            print(f"Next prediction: ${forecast['predictions'][0]:,.2f}")
+            print(f"10-step prediction: ${forecast['predictions'][-1]:,.2f}")
+            print(f"Avg volatility forecast: {np.mean(forecast['volatility_forecasts']):.4f}")
+        
+        if results['garch_results']:
+            garch = results['garch_results']
+            print(f"\nGARCH Model:")
+            print(f"Log-likelihood: {garch['fitted_model'].loglikelihood:.2f}")
+            print(f"AIC: {garch['fitted_model'].aic:.2f}")
+            print(f"ARCH effect removed: {garch['diagnostics']['arch_effect_removed']}")
+        
+        print(f"\nTotal Analysis Duration: {results['duration']}")
+        print(f"All outputs saved to: {forecaster.output_dir}")
+    else:
+        print("Analysis failed. Check logs for details.")
+        
