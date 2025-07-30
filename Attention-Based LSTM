@@ -1,0 +1,1155 @@
+import pandas as pd
+import numpy as np
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader, TensorDataset
+from sklearn.preprocessing import MinMaxScaler
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from sklearn.model_selection import TimeSeriesSplit
+import matplotlib.pyplot as plt
+import os
+import logging
+import warnings
+from typing import Dict, List, Tuple, Optional, Union
+import json
+from datetime import datetime
+
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+warnings.filterwarnings('ignore')
+
+class ImprovedBitcoinLSTM:
+    """
+    Enhanced Bitcoin LSTM prediction model with robust features and production-ready code
+    """
+    
+    def __init__(self, data_path: str, config: Optional[Dict] = None):
+        self.data_path = data_path
+        # Merge custom config with defaults
+        self.config = self._default_config()
+        if config:
+            self.config.update(config)
+        
+        self.df = None
+        self.df_enhanced = None
+        self.sequence_scaler = MinMaxScaler()
+        self.model = None
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        
+        # Create output directory
+        self.output_dir = os.path.join(os.path.dirname(data_path), 'lstm_output')
+        os.makedirs(self.output_dir, exist_ok=True)
+        
+        logger.info(f"Initialized Bitcoin LSTM with device: {self.device}")
+        
+    def _default_config(self) -> Dict:
+        """Default configuration parameters"""
+        return {
+            'sequence_length': 30,
+            'hidden_size': 64,
+            'num_layers': 2,
+            'dropout': 0.3,
+            'batch_size': 64,
+            'learning_rate': 0.001,
+            'epochs': 200,
+            'patience': 30,
+            'test_size': 0.2,
+            'weight_decay': 0.01,
+            'gradient_clip': 0.5,
+            'cv_splits': 5
+        }
+    
+    def save_config(self):
+        """Save configuration to file"""
+        config_path = os.path.join(self.output_dir, 'config.json')
+        with open(config_path, 'w') as f:
+            json.dump(self.config, f, indent=2)
+        logger.info(f"Configuration saved to {config_path}")
+    
+    def load_and_preprocess_data(self) -> Optional[pd.DataFrame]:
+        """Load and preprocess Bitcoin data with robust error handling"""
+        
+        logger.info(f"Loading data from: {self.data_path}")
+        
+        try:
+            # Try different separators
+            for sep in [';', ',', '\t', '|']:
+                try:
+                    self.df = pd.read_csv(self.data_path, sep=sep)
+                    if len(self.df.columns) > 1:  # Valid separation found
+                        break
+                except (pd.errors.EmptyDataError, pd.errors.ParserError):
+                    continue
+            else:
+                raise ValueError("Could not parse CSV with any common separator")
+                
+            if self.df.empty:
+                raise ValueError("Loaded DataFrame is empty")
+                
+            logger.info(f"✅ Successfully loaded: {self.data_path}")
+            logger.info(f"   Shape: {self.df.shape}")
+            logger.info(f"   Columns: {list(self.df.columns)}")
+            
+        except Exception as e:
+            logger.error(f"❌ Error loading data: {str(e)}")
+            return None
+        
+        # Clean column names
+        self.df.columns = self.df.columns.str.strip().str.replace('"', '')
+        
+        # Handle different column name variations
+        column_mapping = {
+            'timeOpen': ['timeOpen', 'timestamp', 'date', 'time', 'Date', 'Time'],
+            'open': ['open', 'Open', 'OPEN'],
+            'high': ['high', 'High', 'HIGH'],
+            'low': ['low', 'Low', 'LOW'], 
+            'close': ['close', 'Close', 'CLOSE'],
+            'volume': ['volume', 'Volume', 'VOLUME', 'vol']
+        }
+        
+        # Map columns to standard names
+        for standard_name, possible_names in column_mapping.items():
+            for possible_name in possible_names:
+                if possible_name in self.df.columns:
+                    if standard_name != possible_name:
+                        self.df = self.df.rename(columns={possible_name: standard_name})
+                    break
+        
+        # Ensure we have required columns
+        required_cols = ['open', 'high', 'low', 'close']
+        missing_cols = [col for col in required_cols if col not in self.df.columns]
+        if missing_cols:
+            logger.error(f"❌ Missing required columns: {missing_cols}")
+            return None
+        
+        # Parse datetime if exists
+        if 'timeOpen' in self.df.columns:
+            self.df['timeOpen'] = pd.to_datetime(
+                self.df['timeOpen'].astype(str).str.replace('"', ''), 
+                errors='coerce'
+            )
+            self.df = self.df.sort_values('timeOpen').reset_index(drop=True)
+        
+        # Convert numeric columns
+        numeric_cols = ['open', 'high', 'low', 'close']
+        if 'volume' in self.df.columns:
+            numeric_cols.append('volume')
+            
+        for col in numeric_cols:
+            self.df[col] = pd.to_numeric(self.df[col], errors='coerce')
+        
+        # Handle missing values
+        self.df = self.df.dropna(subset=['open', 'high', 'low', 'close'])
+        
+        # Add volume if missing
+        if 'volume' not in self.df.columns:
+            self.df['volume'] = 1.0  # Default volume
+        else:
+            self.df['volume'] = self.df['volume'].fillna(1.0)
+        
+        # Validate data quality
+        validation_issues = self.validate_data()
+        if validation_issues:
+            logger.warning(f"Data validation issues: {validation_issues}")
+        
+        logger.info(f"✅ Data preprocessed: {len(self.df)} rows")
+        if 'timeOpen' in self.df.columns:
+            logger.info(f"   Date range: {self.df['timeOpen'].min()} to {self.df['timeOpen'].max()}")
+        logger.info(f"   Price range: ${self.df['close'].min():,.2f} - ${self.df['close'].max():,.2f}")
+        
+        return self.df
+    
+    def validate_data(self) -> List[str]:
+        """Validate data quality before training"""
+        issues = []
+        
+        # Check for sufficient data
+        if len(self.df) < 100:
+            issues.append("Insufficient data points (< 100)")
+        
+        # Check for excessive missing values
+        missing_pct = self.df.isnull().sum() / len(self.df) * 100
+        if (missing_pct > 10).any():
+            high_missing = missing_pct[missing_pct > 10].to_dict()
+            issues.append(f"High missing values: {high_missing}")
+        
+        # Check for price anomalies
+        price_changes = self.df['close'].pct_change().abs()
+        extreme_changes = (price_changes > 0.5).sum()
+        if extreme_changes > len(self.df) * 0.01:
+            issues.append(f"Many extreme price changes: {extreme_changes}")
+        
+        # Check for zero or negative prices
+        if (self.df[['open', 'high', 'low', 'close']] <= 0).any().any():
+            issues.append("Zero or negative prices detected")
+        
+        return issues
+    
+    def create_technical_features(self) -> pd.DataFrame:
+        """Create comprehensive technical indicators for LSTM"""
+        
+        logger.info("🔧 Creating technical features...")
+        
+        df = self.df.copy()
+        
+        # Simple moving averages
+        for window in [5, 10, 20, 50]:
+            df[f'sma_{window}'] = df['close'].rolling(window=window).mean()
+            df[f'ema_{window}'] = df['close'].ewm(span=window).mean()
+        
+        # RSI
+        def calculate_rsi(prices, window=14):
+            delta = prices.diff()
+            gain = (delta.where(delta > 0, 0)).rolling(window=window).mean()
+            loss = (-delta.where(delta < 0, 0)).rolling(window=window).mean()
+            rs = gain / loss
+            rsi = 100 - (100 / (1 + rs))
+            return rsi
+        
+        df['rsi_14'] = calculate_rsi(df['close'], 14)
+        
+        # MACD
+        ema_12 = df['close'].ewm(span=12).mean()
+        ema_26 = df['close'].ewm(span=26).mean()
+        df['macd'] = ema_12 - ema_26
+        df['macd_signal'] = df['macd'].ewm(span=9).mean()
+        df['macd_histogram'] = df['macd'] - df['macd_signal']
+        
+        # Bollinger Bands
+        bb_middle = df['close'].rolling(window=20).mean()
+        bb_std = df['close'].rolling(window=20).std()
+        df['bb_upper'] = bb_middle + (bb_std * 2)
+        df['bb_lower'] = bb_middle - (bb_std * 2)
+        df['bb_position'] = (df['close'] - df['bb_lower']) / (df['bb_upper'] - df['bb_lower'])
+        df['bb_width'] = (df['bb_upper'] - df['bb_lower']) / bb_middle
+        
+        # Stochastic Oscillator
+        low_min = df['low'].rolling(window=14).min()
+        high_max = df['high'].rolling(window=14).max()
+        df['stoch_k'] = 100 * (df['close'] - low_min) / (high_max - low_min)
+        df['stoch_d'] = df['stoch_k'].rolling(window=3).mean()
+        
+        # Average True Range (ATR)
+        high_low = df['high'] - df['low']
+        high_close = np.abs(df['high'] - df['close'].shift())
+        low_close = np.abs(df['low'] - df['close'].shift())
+        tr = np.maximum(high_low, np.maximum(high_close, low_close))
+        df['atr'] = tr.rolling(window=14).mean()
+        
+        # Price ratios and patterns
+        df['high_low_ratio'] = df['high'] / df['low']
+        df['close_open_ratio'] = df['close'] / df['open']
+        df['body_size'] = np.abs(df['close'] - df['open']) / df['open']
+        df['upper_shadow'] = (df['high'] - np.maximum(df['open'], df['close'])) / df['open']
+        df['lower_shadow'] = (np.minimum(df['open'], df['close']) - df['low']) / df['open']
+        
+        # Returns and volatility
+        df['returns'] = df['close'].pct_change()
+        df['log_returns'] = np.log(df['close'] / df['close'].shift())
+        df['volatility'] = df['returns'].rolling(window=20).std()
+        df['volatility_ratio'] = df['volatility'] / df['volatility'].rolling(window=50).mean()
+        
+        # Volume-based features
+        if 'volume' in df.columns:
+            df['volume_sma'] = df['volume'].rolling(window=20).mean()
+            df['volume_ratio'] = df['volume'] / df['volume_sma']
+            df['price_volume'] = df['close'] * df['volume']
+            df['vwap'] = (df['price_volume'].rolling(window=20).sum() / 
+                         df['volume'].rolling(window=20).sum())
+        
+        # Market regime detection
+        df['trend_strength'] = ((df['close'] - df['close'].rolling(50).mean()) / 
+                               df['close'].rolling(50).std())
+        
+        # Lag features
+        for lag in [1, 2, 3, 5]:
+            df[f'close_lag_{lag}'] = df['close'].shift(lag)
+            df[f'volume_lag_{lag}'] = df['volume'].shift(lag)
+        
+        # Fill missing values using forward fill, then backward fill, then zero
+        df = df.ffill().bfill().fillna(0)
+        df = df.replace([np.inf, -np.inf], np.nan).fillna(0)
+        
+        self.df_enhanced = df
+        logger.info(f"✅ Technical features created: {len(df.columns)} total columns")
+        
+        return df
+    
+    def prepare_lstm_data(self, sequence_length: Optional[int] = None) -> Tuple[np.ndarray, np.ndarray, List[str]]:
+        """Prepare data for LSTM training with memory optimization"""
+        
+        seq_len = sequence_length or self.config['sequence_length']
+        logger.info(f"📊 Preparing LSTM data with sequence length: {seq_len}")
+        
+        # Select features for LSTM (excluding lagged features for the target)
+        feature_cols = [
+            'open', 'high', 'low', 'close', 'volume',
+            'rsi_14', 'macd', 'macd_signal', 'bb_position', 'bb_width',
+            'stoch_k', 'atr', 'volatility', 'trend_strength'
+        ]
+        
+        # Add available features
+        available_features = [f for f in feature_cols if f in self.df_enhanced.columns]
+        
+        # Add some lag features but not close lags (to avoid data leakage)
+        lag_features = [f for f in self.df_enhanced.columns if 'lag' in f and 'close_lag' not in f]
+        available_features.extend(lag_features[:5])  # Limit lag features
+        
+        logger.info(f"   Using {len(available_features)} features: {available_features}")
+        
+        # Extract data
+        data = self.df_enhanced[available_features].values.astype('float32')
+        
+        # Remove outliers using IQR method
+        Q1 = np.percentile(data, 25, axis=0)
+        Q3 = np.percentile(data, 75, axis=0)
+        IQR = Q3 - Q1
+        lower_bound = Q1 - 1.5 * IQR
+        upper_bound = Q3 + 1.5 * IQR
+        
+        data = np.clip(data, lower_bound, upper_bound)
+        
+        # Scale the data
+        data_scaled = self.sequence_scaler.fit_transform(data)
+        
+        # Create sequences efficiently
+        if len(data_scaled) > 50000:  # Use memory-efficient approach for large datasets
+            return self._prepare_data_chunked(data_scaled, seq_len, available_features)
+        else:
+            return self._prepare_data_standard(data_scaled, seq_len, available_features)
+    
+    def _prepare_data_standard(self, data_scaled: np.ndarray, seq_len: int, features: List[str]) -> Tuple[np.ndarray, np.ndarray, List[str]]:
+        """Standard sequence preparation"""
+        X_seq, y_seq = [], []
+        
+        for i in range(seq_len, len(data_scaled)):
+            X_seq.append(data_scaled[i-seq_len:i])
+            y_seq.append(data_scaled[i, 3])  # close price is at index 3
+        
+        X_seq = np.array(X_seq, dtype=np.float32)
+        y_seq = np.array(y_seq, dtype=np.float32)
+        
+        logger.info(f"✅ Data prepared: {len(X_seq)} sequences")
+        logger.info(f"   Input shape: {X_seq.shape}")
+        logger.info(f"   Output shape: {y_seq.shape}")
+        
+        return X_seq, y_seq, features
+    
+    def _prepare_data_chunked(self, data_scaled: np.ndarray, seq_len: int, features: List[str], chunk_size: int = 10000) -> Tuple[np.ndarray, np.ndarray, List[str]]:
+        """Memory-efficient sequence preparation for large datasets"""
+        X_chunks, y_chunks = [], []
+        
+        for start in range(0, len(data_scaled) - seq_len, chunk_size):
+            end = min(start + chunk_size + seq_len, len(data_scaled))
+            chunk_data = data_scaled[start:end]
+            
+            X_chunk, y_chunk = [], []
+            for i in range(seq_len, len(chunk_data)):
+                X_chunk.append(chunk_data[i-seq_len:i])
+                y_chunk.append(chunk_data[i, 3])
+            
+            if X_chunk:
+                X_chunks.extend(X_chunk)
+                y_chunks.extend(y_chunk)
+        
+        X_seq = np.array(X_chunks, dtype=np.float32)
+        y_seq = np.array(y_chunks, dtype=np.float32)
+        
+        logger.info(f"✅ Data prepared (chunked): {len(X_seq)} sequences")
+        logger.info(f"   Input shape: {X_seq.shape}")
+        logger.info(f"   Output shape: {y_seq.shape}")
+        
+        return X_seq, y_seq, features
+    
+    def create_lstm_model(self, input_size: int) -> nn.Module:
+        """Create enhanced LSTM model"""
+        
+        class EnhancedLSTM(nn.Module):
+            def __init__(self, input_size: int, hidden_size: int = 64, num_layers: int = 2, dropout: float = 0.3):
+                super(EnhancedLSTM, self).__init__()
+                
+                self.hidden_size = hidden_size
+                self.num_layers = num_layers
+                
+                # LSTM layers
+                self.lstm = nn.LSTM(
+                    input_size, hidden_size, num_layers,
+                    batch_first=True, dropout=dropout if num_layers > 1 else 0,
+                    bidirectional=False
+                )
+                
+                # Attention mechanism (simplified)
+                self.attention = nn.Linear(hidden_size, 1)
+                
+                # Batch normalization
+                self.batch_norm = nn.BatchNorm1d(hidden_size)
+                
+                # Fully connected layers
+                self.fc1 = nn.Linear(hidden_size, hidden_size // 2)
+                self.fc2 = nn.Linear(hidden_size // 2, hidden_size // 4)
+                self.fc3 = nn.Linear(hidden_size // 4, 1)
+                
+                # Dropout and activation
+                self.dropout = nn.Dropout(dropout)
+                self.activation = nn.ReLU()
+                self.final_activation = nn.Tanh()  # Helps with stability
+                
+                self._init_weights()
+                
+            def _init_weights(self):
+                for name, param in self.named_parameters():
+                    if 'weight_ih' in name:
+                        nn.init.xavier_uniform_(param.data)
+                    elif 'weight_hh' in name:
+                        nn.init.orthogonal_(param.data)
+                    elif 'bias' in name:
+                        param.data.fill_(0)
+                        
+            def forward(self, x):
+                batch_size = x.size(0)
+                
+                # LSTM forward pass
+                lstm_out, (h_n, c_n) = self.lstm(x)
+                
+                # Simple attention mechanism
+                attention_weights = torch.softmax(self.attention(lstm_out), dim=1)
+                attended_output = torch.sum(attention_weights * lstm_out, dim=1)
+                
+                # Batch normalization (only if batch size > 1)
+                if batch_size > 1:
+                    attended_output = self.batch_norm(attended_output)
+                
+                # Fully connected layers with residual connections
+                x1 = self.dropout(self.activation(self.fc1(attended_output)))
+                x2 = self.dropout(self.activation(self.fc2(x1)))
+                
+                # Skip connection
+                if x1.size(1) == x2.size(1):
+                    x2 = x2 + x1
+                
+                output = self.fc3(x2)
+                output = self.final_activation(output)
+                
+                return output
+        
+        model = EnhancedLSTM(
+            input_size, 
+            self.config['hidden_size'], 
+            self.config['num_layers'], 
+            self.config['dropout']
+        )
+        
+        logger.info(f"🧠 Enhanced LSTM model created:")
+        logger.info(f"   Input size: {input_size}")
+        logger.info(f"   Hidden size: {self.config['hidden_size']}")
+        logger.info(f"   Layers: {self.config['num_layers']}")
+        logger.info(f"   Dropout: {self.config['dropout']}")
+        logger.info(f"   Parameters: {sum(p.numel() for p in model.parameters()):,}")
+        
+        return model
+    
+    def train_model(self, X_seq: np.ndarray, y_seq: np.ndarray) -> Dict:
+        """Train the LSTM model with enhanced features"""
+        
+        logger.info("🚀 Training enhanced LSTM model...")
+        
+        # Split data (time-aware split)
+        split_idx = int(len(X_seq) * (1 - self.config['test_size']))
+        X_train, X_test = X_seq[:split_idx], X_seq[split_idx:]
+        y_train, y_test = y_seq[:split_idx], y_seq[split_idx:]
+        
+        # Convert to tensors
+        X_train_tensor = torch.tensor(X_train, dtype=torch.float32)
+        y_train_tensor = torch.tensor(y_train, dtype=torch.float32).unsqueeze(1)
+        X_test_tensor = torch.tensor(X_test, dtype=torch.float32)
+        y_test_tensor = torch.tensor(y_test, dtype=torch.float32).unsqueeze(1)
+        
+        # Create model
+        input_size = X_seq.shape[2]
+        self.model = self.create_lstm_model(input_size)
+        self.model = self.model.to(self.device)
+        
+        # Loss and optimizer
+        criterion = nn.MSELoss()
+        optimizer = torch.optim.AdamW(
+            self.model.parameters(), 
+            lr=self.config['learning_rate'], 
+            weight_decay=self.config['weight_decay'],
+            betas=(0.9, 0.999)
+        )
+        
+        # Learning rate scheduler
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, mode='min', patience=15, factor=0.5
+        )
+        
+        # Data loaders
+        train_dataset = TensorDataset(X_train_tensor, y_train_tensor)
+        test_dataset = TensorDataset(X_test_tensor, y_test_tensor)
+        
+        train_loader = DataLoader(train_dataset, batch_size=self.config['batch_size'], shuffle=False)
+        test_loader = DataLoader(test_dataset, batch_size=self.config['batch_size'], shuffle=False)
+        
+        # Training tracking
+        best_loss = float('inf')
+        patience_counter = 0
+        train_losses = []
+        val_losses = []
+        
+        logger.info(f"   Training samples: {len(X_train)}")
+        logger.info(f"   Validation samples: {len(X_test)}")
+        logger.info(f"   Epochs: {self.config['epochs']}")
+        logger.info(f"   Batch size: {self.config['batch_size']}")
+        logger.info(f"   Learning rate: {self.config['learning_rate']}")
+        logger.info("\n🔄 Training progress:")
+        
+        for epoch in range(self.config['epochs']):
+            # Training phase
+            self.model.train()
+            train_loss = 0
+            
+            for batch_x, batch_y in train_loader:
+                batch_x, batch_y = batch_x.to(self.device), batch_y.to(self.device)
+                
+                optimizer.zero_grad()
+                output = self.model(batch_x)
+                loss = criterion(output, batch_y)
+                loss.backward()
+                
+                # Gradient clipping
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=self.config['gradient_clip'])
+                
+                optimizer.step()
+                train_loss += loss.item()
+            
+            # Validation phase
+            self.model.eval()
+            val_loss = 0
+            with torch.no_grad():
+                for batch_x, batch_y in test_loader:
+                    batch_x, batch_y = batch_x.to(self.device), batch_y.to(self.device)
+                    output = self.model(batch_x)
+                    val_loss += criterion(output, batch_y).item()
+            
+            avg_train_loss = train_loss / len(train_loader)
+            avg_val_loss = val_loss / len(test_loader)
+            
+            train_losses.append(avg_train_loss)
+            val_losses.append(avg_val_loss)
+            
+            scheduler.step(avg_val_loss)
+            
+            # Early stopping and checkpointing
+            if avg_val_loss < best_loss:
+                best_loss = avg_val_loss
+                patience_counter = 0
+                # Save best model
+                self.save_checkpoint(epoch, optimizer, avg_val_loss, 'best_model.pth')
+            else:
+                patience_counter += 1
+                
+            # Print progress
+            if epoch % 20 == 0 or epoch == self.config['epochs'] - 1:
+                logger.info(f"   Epoch {epoch:3d}: Train Loss: {avg_train_loss:.6f}, Val Loss: {avg_val_loss:.6f}")
+                
+            # Early stopping check
+            if patience_counter >= self.config['patience']:
+                logger.info(f"✋ Early stopping at epoch {epoch}")
+                break
+        
+        # Load best model if checkpoint exists
+        best_checkpoint_path = os.path.join(self.output_dir, 'best_model.pth')
+        if os.path.exists(best_checkpoint_path):
+            self.load_checkpoint('best_model.pth')
+        else:
+            logger.warning("No best model checkpoint found, using current model state")
+        
+        logger.info("✅ Training completed!")
+        
+        return {
+            'train_losses': train_losses,
+            'val_losses': val_losses,
+            'X_test': X_test,
+            'y_test': y_test,
+            'X_test_tensor': X_test_tensor,
+            'y_test_tensor': y_test_tensor,
+            'best_loss': best_loss
+        }
+    
+    def save_checkpoint(self, epoch: int, optimizer, loss: float, filename: str):
+        """Save training checkpoint"""
+        filepath = os.path.join(self.output_dir, filename)
+        checkpoint = {
+            'epoch': epoch,
+            'model_state_dict': self.model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'loss': loss,
+            'config': self.config
+        }
+        torch.save(checkpoint, filepath)
+        
+        # Save scaler separately to avoid serialization issues
+        scaler_path = os.path.join(self.output_dir, f'scaler_{filename}.pkl')
+        import pickle
+        with open(scaler_path, 'wb') as f:
+            pickle.dump(self.sequence_scaler, f)
+    
+    def load_checkpoint(self, filename: str):
+        """Load training checkpoint"""
+        filepath = os.path.join(self.output_dir, filename)
+        if not os.path.exists(filepath):
+            logger.warning(f"Checkpoint file not found: {filepath}")
+            return None
+            
+        # Load with weights_only=False for our trusted checkpoint
+        checkpoint = torch.load(filepath, map_location=self.device, weights_only=False)
+        self.model.load_state_dict(checkpoint['model_state_dict'])
+        
+        # Load scaler separately
+        scaler_path = os.path.join(self.output_dir, f'scaler_{filename}.pkl')
+        if os.path.exists(scaler_path):
+            import pickle
+            with open(scaler_path, 'rb') as f:
+                self.sequence_scaler = pickle.load(f)
+        
+        return checkpoint
+    
+    def calculate_trading_metrics(self, y_true: np.ndarray, y_pred: np.ndarray) -> Dict:
+        """Calculate finance-specific metrics"""
+        
+        # Directional accuracy
+        true_direction = np.diff(y_true) > 0
+        pred_direction = np.diff(y_pred) > 0
+        directional_accuracy = np.mean(true_direction == pred_direction)
+        
+        # Returns analysis
+        returns_true = np.diff(y_true) / y_true[:-1]
+        returns_pred = np.diff(y_pred) / y_pred[:-1]
+        
+        # Sharpe ratio of predictions
+        if np.std(returns_pred) > 0:
+            sharpe_pred = np.mean(returns_pred) / np.std(returns_pred) * np.sqrt(252)
+        else:
+            sharpe_pred = 0
+        
+        # Maximum drawdown
+        cumulative_returns_pred = np.cumprod(1 + returns_pred)
+        running_max = np.maximum.accumulate(cumulative_returns_pred)
+        drawdown = (cumulative_returns_pred - running_max) / running_max
+        max_drawdown = np.min(drawdown)
+        
+        # Volatility metrics
+        volatility_true = np.std(returns_true) * np.sqrt(252)
+        volatility_pred = np.std(returns_pred) * np.sqrt(252)
+        
+        return {
+            'directional_accuracy': directional_accuracy,
+            'sharpe_ratio': sharpe_pred,
+            'max_drawdown': max_drawdown,
+            'volatility_true': volatility_true,
+            'volatility_pred': volatility_pred,
+            'correlation': np.corrcoef(returns_true, returns_pred)[0, 1]
+        }
+    
+    def evaluate_model(self, training_results: Dict, available_features: List[str]) -> Dict:
+        """Evaluate the trained model with comprehensive metrics"""
+        
+        logger.info("\n📊 Evaluating model...")
+        
+        X_test_tensor = training_results['X_test_tensor']
+        y_test = training_results['y_test']
+        
+        # Make predictions
+        self.model.eval()
+        with torch.no_grad():
+            X_test_device = X_test_tensor.to(self.device)
+            y_pred_scaled = self.model(X_test_device).cpu().numpy()
+        
+        # Inverse transform predictions
+        dummy_data = np.zeros((len(y_pred_scaled), len(available_features)))
+        dummy_data[:, 3] = y_pred_scaled.flatten()  # close price at index 3
+        y_pred_original = self.sequence_scaler.inverse_transform(dummy_data)[:, 3]
+        
+        dummy_data[:, 3] = y_test
+        y_test_original = self.sequence_scaler.inverse_transform(dummy_data)[:, 3]
+        
+        # Calculate standard metrics
+        mae = mean_absolute_error(y_test_original, y_pred_original)
+        rmse = np.sqrt(mean_squared_error(y_test_original, y_pred_original))
+        r2 = r2_score(y_test_original, y_pred_original)
+        mape = np.mean(np.abs((y_test_original - y_pred_original) / y_test_original)) * 100
+        
+        # Calculate trading metrics
+        trading_metrics = self.calculate_trading_metrics(y_test_original, y_pred_original)
+        
+        logger.info(f"\n✅ Model Performance:")
+        logger.info(f"   MAE:  ${mae:,.2f}")
+        logger.info(f"   RMSE: ${rmse:,.2f}")
+        logger.info(f"   R²:   {r2:.4f}")
+        logger.info(f"   MAPE: {mape:.2f}%")
+        logger.info(f"\n💰 Trading Metrics:")
+        logger.info(f"   Directional Accuracy: {trading_metrics['directional_accuracy']:.2%}")
+        logger.info(f"   Sharpe Ratio: {trading_metrics['sharpe_ratio']:.4f}")
+        logger.info(f"   Max Drawdown: {trading_metrics['max_drawdown']:.2%}")
+        
+        # Plot results
+        self.plot_results(y_test_original, y_pred_original, training_results['train_losses'], training_results['val_losses'])
+        
+        evaluation_results = {
+            'mae': mae,
+            'rmse': rmse,
+            'r2': r2,
+            'mape': mape,
+            'y_true': y_test_original,
+            'y_pred': y_pred_original,
+            **trading_metrics
+        }
+        
+        # Save results
+        results_path = os.path.join(self.output_dir, 'evaluation_results.json')
+        with open(results_path, 'w') as f:
+            # Convert numpy arrays to lists for JSON serialization
+            json_results = self._convert_for_json(evaluation_results)
+            json.dump(json_results, f, indent=2)
+        
+        return evaluation_results
+    
+    def plot_results(self, y_true: np.ndarray, y_pred: np.ndarray, train_losses: List[float], val_losses: List[float]):
+        """Plot comprehensive training results and predictions"""
+        
+        fig, axes = plt.subplots(2, 3, figsize=(20, 12))
+        
+        # 1. Training losses
+        axes[0, 0].plot(train_losses, label='Training Loss', color='blue', alpha=0.8)
+        axes[0, 0].plot(val_losses, label='Validation Loss', color='red', alpha=0.8)
+        axes[0, 0].set_title('Training and Validation Loss', fontsize=14, fontweight='bold')
+        axes[0, 0].set_xlabel('Epoch')
+        axes[0, 0].set_ylabel('Loss')
+        axes[0, 0].legend()
+        axes[0, 0].grid(True, alpha=0.3)
+        
+        # 2. Predictions vs actual (scatter)
+        axes[0, 1].scatter(y_true, y_pred, alpha=0.6, color='green', s=20)
+        axes[0, 1].plot([y_true.min(), y_true.max()], [y_true.min(), y_true.max()], 'r--', lw=2)
+        axes[0, 1].set_title(f'Predictions vs Actual (R² = {r2_score(y_true, y_pred):.4f})', 
+                            fontsize=14, fontweight='bold')
+        axes[0, 1].set_xlabel('True Price ($)')
+        axes[0, 1].set_ylabel('Predicted Price ($)')
+        axes[0, 1].grid(True, alpha=0.3)
+        
+        # 3. Time series plot (last 200 points)
+        plot_len = min(200, len(y_true))
+        indices = range(len(y_true) - plot_len, len(y_true))
+        
+        axes[0, 2].plot(indices, y_true[-plot_len:], label='Actual', color='black', linewidth=2)
+        axes[0, 2].plot(indices, y_pred[-plot_len:], label='Predicted', color='red', linewidth=2, alpha=0.8)
+        axes[0, 2].set_title(f'Price Predictions (Last {plot_len} points)', fontsize=14, fontweight='bold')
+        axes[0, 2].set_xlabel('Time Index')
+        axes[0, 2].set_ylabel('Price ($)')
+        axes[0, 2].legend()
+        axes[0, 2].grid(True, alpha=0.3)
+        
+        # 4. Residuals
+        residuals = y_true - y_pred
+        axes[1, 0].scatter(y_pred, residuals, alpha=0.6, color='purple', s=20)
+        axes[1, 0].axhline(y=0, color='red', linestyle='--')
+        axes[1, 0].set_title('Residuals vs Predictions', fontsize=14, fontweight='bold')
+        axes[1, 0].set_xlabel('Predicted Price ($)')
+        axes[1, 0].set_ylabel('Residuals ($)')
+        axes[1, 0].grid(True, alpha=0.3)
+        
+        # 5. Distribution of residuals
+        axes[1, 1].hist(residuals, bins=50, alpha=0.7, color='orange', edgecolor='black')
+        axes[1, 1].axvline(x=0, color='red', linestyle='--')
+        axes[1, 1].set_title('Distribution of Residuals', fontsize=14, fontweight='bold')
+        axes[1, 1].set_xlabel('Residuals ($)')
+        axes[1, 1].set_ylabel('Frequency')
+        axes[1, 1].grid(True, alpha=0.3)
+        
+        # 6. Percentage errors
+        percentage_errors = (residuals / y_true) * 100
+        axes[1, 2].hist(percentage_errors, bins=50, alpha=0.7, color='cyan', edgecolor='black')
+        axes[1, 2].axvline(x=0, color='red', linestyle='--')
+        axes[1, 2].set_title('Distribution of Percentage Errors', fontsize=14, fontweight='bold')
+        axes[1, 2].set_xlabel('Percentage Error (%)')
+        axes[1, 2].set_ylabel('Frequency')
+        axes[1, 2].grid(True, alpha=0.3)
+        
+        plt.tight_layout()
+        
+        # Save plot
+        plot_path = os.path.join(self.output_dir, 'evaluation_plots.png')
+        plt.savefig(plot_path, dpi=300, bbox_inches='tight')
+        plt.show()
+        
+        logger.info(f"📊 Plots saved to {plot_path}")
+    
+    def predict_future(self, n_steps: int = 30, use_monte_carlo: bool = False, n_simulations: int = 100) -> Union[np.ndarray, Dict]:
+        """Enhanced future price prediction with uncertainty estimation"""
+        
+        if self.model is None:
+            logger.error("❌ Model not trained yet!")
+            return None
+        
+        logger.info(f"🔮 Predicting next {n_steps} prices...")
+        
+        if use_monte_carlo:
+            logger.info(f"   Using Monte Carlo with {n_simulations} simulations")
+            return self._predict_with_uncertainty(n_steps, n_simulations)
+        else:
+            return self._single_prediction_sequence(n_steps)
+    
+    def _single_prediction_sequence(self, n_steps: int) -> np.ndarray:
+        """Single deterministic prediction sequence"""
+        
+        # Get feature columns
+        feature_cols = [
+            'open', 'high', 'low', 'close', 'volume',
+            'rsi_14', 'macd', 'macd_signal', 'bb_position', 'bb_width',
+            'stoch_k', 'atr', 'volatility', 'trend_strength'
+        ]
+        available_features = [f for f in feature_cols if f in self.df_enhanced.columns]
+        
+        # Add some lag features
+        lag_features = [f for f in self.df_enhanced.columns if 'lag' in f and 'close_lag' not in f]
+        available_features.extend(lag_features[:5])
+        
+        data = self.df_enhanced[available_features].values.astype('float32')
+        data_scaled = self.sequence_scaler.transform(data)
+        
+        # Start with last sequence
+        sequence_length = self.config['sequence_length']
+        last_sequence = data_scaled[-sequence_length:].reshape(1, sequence_length, -1)
+        
+        self.model.eval()
+        predictions = []
+        current_sequence = torch.tensor(last_sequence, dtype=torch.float32).to(self.device)
+        
+        with torch.no_grad():
+            for step in range(n_steps):
+                # Predict next value
+                pred = self.model(current_sequence)
+                predictions.append(pred.cpu().item())
+                
+                # Update sequence with prediction
+                new_point = current_sequence[0, -1, :].clone()
+                new_point[3] = pred.item()  # Update close price
+                
+                # Simple feature update (in practice, you'd want more sophisticated feature updates)
+                if step > 0:
+                    # Update some technical indicators based on prediction
+                    prev_close = current_sequence[0, -1, 3].item()
+                    current_close = pred.item()
+                    
+                    # Simple RSI approximation
+                    if len(predictions) > 1:
+                        price_change = current_close - prev_close
+                        # This is a simplified update - in practice you'd maintain full indicator state
+                        new_point[5] = torch.clamp(new_point[5] + 0.1 * price_change, 0, 1)  # RSI approximation
+                
+                # Roll the sequence
+                current_sequence = torch.cat([
+                    current_sequence[:, 1:, :],
+                    new_point.unsqueeze(0).unsqueeze(0)
+                ], dim=1)
+        
+        # Inverse transform predictions
+        dummy_data = np.zeros((len(predictions), len(available_features)))
+        dummy_data[:, 3] = predictions
+        future_prices = self.sequence_scaler.inverse_transform(dummy_data)[:, 3]
+        
+        logger.info(f"✅ Future predictions (first 10):")
+        for i, price in enumerate(future_prices[:10], 1):
+            print(f"   Day {i}: ${price:,.2f}")
+        
+        return future_prices
+    
+    def _predict_with_uncertainty(self, n_steps: int, n_simulations: int) -> Dict:
+        """Monte Carlo prediction with uncertainty estimation"""
+        
+        predictions_ensemble = []
+        
+        # Enable dropout for uncertainty estimation
+        def enable_dropout(model):
+            for module in model.modules():
+                if module.__class__.__name__.startswith('Dropout'):
+                    module.train()
+        
+        self.model.eval()
+        enable_dropout(self.model)
+        
+        for sim in range(n_simulations):
+            if sim % 20 == 0:
+                logger.info(f"   Simulation {sim + 1}/{n_simulations}")
+            
+            pred = self._single_prediction_sequence(n_steps)
+            predictions_ensemble.append(pred)
+        
+        predictions_ensemble = np.array(predictions_ensemble)
+        
+        # Calculate statistics
+        mean_pred = np.mean(predictions_ensemble, axis=0)
+        std_pred = np.std(predictions_ensemble, axis=0)
+        
+        # Confidence intervals
+        confidence_intervals = {
+            '68%': (np.percentile(predictions_ensemble, 16, axis=0), 
+                   np.percentile(predictions_ensemble, 84, axis=0)),
+            '95%': (np.percentile(predictions_ensemble, 2.5, axis=0), 
+                   np.percentile(predictions_ensemble, 97.5, axis=0))
+        }
+        
+        logger.info(f"✅ Monte Carlo predictions completed")
+        logger.info(f"   Mean next day: ${mean_pred[0]:,.2f} ± ${std_pred[0]:,.2f}")
+        
+        return {
+            'mean': mean_pred,
+            'std': std_pred,
+            'confidence_intervals': confidence_intervals,
+            'all_simulations': predictions_ensemble
+        }
+    
+    def time_series_cross_validation(self, n_splits: int = 5) -> List[Dict]:
+        """Time-aware cross-validation for financial data"""
+        
+        logger.info(f"🔄 Performing {n_splits}-fold time series cross-validation...")
+        
+        # Prepare data
+        X_seq, y_seq, features = self.prepare_lstm_data()
+        
+        tscv = TimeSeriesSplit(n_splits=n_splits)
+        cv_scores = []
+        
+        for fold, (train_idx, val_idx) in enumerate(tscv.split(X_seq)):
+            logger.info(f"   Fold {fold + 1}/{n_splits}")
+            
+            X_train_fold = X_seq[train_idx]
+            y_train_fold = y_seq[train_idx]
+            X_val_fold = X_seq[val_idx]
+            y_val_fold = y_seq[val_idx]
+            
+            # Create and train fold model
+            fold_model = self.create_lstm_model(X_seq.shape[2]).to(self.device)
+            
+            # Quick training for CV (reduced epochs)
+            cv_config = self.config.copy()
+            cv_config['epochs'] = min(50, self.config['epochs'] // 4)
+            cv_config['patience'] = 10
+            
+            # Train fold model (simplified training loop)
+            fold_score = self._train_fold_model(fold_model, X_train_fold, y_train_fold, X_val_fold, y_val_fold, cv_config)
+            cv_scores.append(fold_score)
+            
+            logger.info(f"     Fold {fold + 1} R²: {fold_score['r2']:.4f}")
+        
+        # Calculate CV statistics
+        cv_r2_scores = [score['r2'] for score in cv_scores]
+        cv_mae_scores = [score['mae'] for score in cv_scores]
+        
+        logger.info(f"✅ Cross-validation completed:")
+        logger.info(f"   Mean R²: {np.mean(cv_r2_scores):.4f} ± {np.std(cv_r2_scores):.4f}")
+        logger.info(f"   Mean MAE: {np.mean(cv_mae_scores):.2f} ± {np.std(cv_mae_scores):.2f}")
+        
+        return cv_scores
+    
+    def _train_fold_model(self, model, X_train, y_train, X_val, y_val, config):
+        """Simplified training for cross-validation folds"""
+        
+        # Convert to tensors
+        X_train_tensor = torch.tensor(X_train, dtype=torch.float32).to(self.device)
+        y_train_tensor = torch.tensor(y_train, dtype=torch.float32).unsqueeze(1).to(self.device)
+        X_val_tensor = torch.tensor(X_val, dtype=torch.float32).to(self.device)
+        y_val_tensor = torch.tensor(y_val, dtype=torch.float32).unsqueeze(1).to(self.device)
+        
+        criterion = nn.MSELoss()
+        optimizer = torch.optim.AdamW(model.parameters(), lr=config['learning_rate'])
+        
+        best_val_loss = float('inf')
+        patience_counter = 0
+        
+        for epoch in range(config['epochs']):
+            # Training
+            model.train()
+            optimizer.zero_grad()
+            train_pred = model(X_train_tensor)
+            train_loss = criterion(train_pred, y_train_tensor)
+            train_loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=config.get('gradient_clip', 0.5))
+            optimizer.step()
+            
+            # Validation
+            model.eval()
+            with torch.no_grad():
+                val_pred = model(X_val_tensor)
+                val_loss = criterion(val_pred, y_val_tensor)
+            
+            # Early stopping
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                patience_counter = 0
+                best_val_pred = val_pred.cpu().numpy()
+            else:
+                patience_counter += 1
+                
+            if patience_counter >= config['patience']:
+                break
+        
+        # Calculate metrics
+        val_true = y_val_tensor.cpu().numpy()
+        mae = mean_absolute_error(val_true, best_val_pred)
+        r2 = r2_score(val_true, best_val_pred)
+        
+        return {'mae': mae, 'r2': r2, 'val_loss': best_val_loss.item()}
+    
+    def _convert_for_json(self, obj):
+        """Recursively convert numpy arrays and other non-serializable objects for JSON"""
+        if isinstance(obj, np.ndarray):
+            return obj.tolist()
+        elif isinstance(obj, np.integer):
+            return int(obj)
+        elif isinstance(obj, np.floating):
+            return float(obj)
+        elif isinstance(obj, torch.Tensor):
+            return obj.detach().cpu().numpy().tolist()
+        elif isinstance(obj, dict):
+            return {key: self._convert_for_json(value) for key, value in obj.items()}
+        elif isinstance(obj, (list, tuple)):
+            return [self._convert_for_json(item) for item in obj]
+        else:
+            return obj
+    
+    def run_complete_analysis(self, sequence_length: Optional[int] = None, epochs: Optional[int] = None, run_cv: bool = False) -> Optional[Dict]:
+        """Run complete enhanced LSTM analysis pipeline"""
+        
+        seq_len = sequence_length or self.config['sequence_length']
+        epochs_num = epochs or self.config['epochs']
+        
+        logger.info("🚀 Running Complete Enhanced Bitcoin LSTM Analysis")
+        logger.info("=" * 60)
+        
+        start_time = datetime.now()
+        
+        try:
+            # Save configuration
+            self.save_config()
+            
+            # 1. Load and validate data
+            if self.load_and_preprocess_data() is None:
+                return None
+            
+            # 2. Create enhanced features
+            self.create_technical_features()
+            
+            # 3. Prepare LSTM data
+            X_seq, y_seq, available_features = self.prepare_lstm_data(seq_len)
+            
+            # 4. Optional cross-validation
+            cv_results = None
+            if run_cv:
+                cv_results = self.time_series_cross_validation()
+            
+            # 5. Train final model
+            self.config['epochs'] = epochs_num
+            training_results = self.train_model(X_seq, y_seq)
+            
+            # 6. Evaluate model
+            evaluation_results = self.evaluate_model(training_results, available_features)
+            
+            # 7. Future predictions
+            logger.info("\n🔮 Generating future predictions...")
+            future_predictions_simple = self.predict_future(30, use_monte_carlo=False)
+            future_predictions_mc = self.predict_future(10, use_monte_carlo=True, n_simulations=50)
+            
+            end_time = datetime.now()
+            duration = end_time - start_time
+            
+            logger.info("\n🎉 Analysis completed successfully!")
+            logger.info(f"   Total duration: {duration}")
+            logger.info(f"   Output directory: {self.output_dir}")
+            
+            final_results = {
+                'evaluation': evaluation_results,
+                'training': training_results,
+                'future_predictions_simple': future_predictions_simple,
+                'future_predictions_mc': future_predictions_mc,
+                'cv_results': cv_results,
+                'model': self.model,
+                'config': self.config,
+                'duration': str(duration)
+            }
+            
+            # Save final results
+            results_path = os.path.join(self.output_dir, 'complete_results.json')
+            with open(results_path, 'w') as f:
+                # Convert all non-serializable objects for JSON
+                json_results = {}
+                for k, v in final_results.items():
+                    if k == 'model':
+                        continue  # Skip model object
+                    else:
+                        json_results[k] = self._convert_for_json(v)
+                
+                json.dump(json_results, f, indent=2)
+            
+            return final_results
+            
+        except Exception as e:
+            logger.error(f"\n❌ Error in analysis: {str(e)}")
+            import traceback
+            logger.error(f"Full traceback:\n{traceback.format_exc()}")
+            return None
+
+# Usage Example and Main Execution
+if __name__ == "__main__":
+    print("🧠 Enhanced Bitcoin LSTM Prediction Pipeline")
+    print("=" * 60)
+    
+    # Configuration for the model
+    custom_config = {
+        'sequence_length': 30,
+        'hidden_size': 128,
+        'num_layers': 3,
+        'dropout': 0.2,
+        'batch_size': 32,
+        'learning_rate': 0.0005,
+        'epochs': 150,
+        'patience': 25,
+        'test_size': 0.2
+    }
+    
+    # Initialize and run enhanced model
+    lstm_model = ImprovedBitcoinLSTM(
+        data_path="Bitcoin_12.2013_05.2025.csv",
+        config=custom_config
+    )
+    
+    # Run complete analysis
+    results = lstm_model.run_complete_analysis(
+        sequence_length=30, 
+        epochs=100,
+        run_cv=True  # Set to False to skip cross-validation for faster execution
+    )
+    
+    if results:
+        print(f"\n📊 Final Results Summary:")
+        print(f"=" * 40)
+        print(f"R² Score: {results['evaluation']['r2']:.4f}")
+        print(f"MAPE: {results['evaluation']['mape']:.2f}%")
+        print(f"Directional Accuracy: {results['evaluation']['directional_accuracy']:.2%}")
+        print(f"Sharpe Ratio: {results['evaluation']['sharpe_ratio']:.4f}")
+        print(f"Next Day Prediction: ${results['future_predictions_simple'][0]:,.2f}")
+        
+        if results['future_predictions_mc']:
+            mc_results = results['future_predictions_mc']
+            print(f"Monte Carlo Next Day: ${mc_results['mean'][0]:,.2f} ± ${mc_results['std'][0]:,.2f}")
+        
+        if results['cv_results']:
+            cv_r2_scores = [score['r2'] for score in results['cv_results']]
+            print(f"Cross-Validation R²: {np.mean(cv_r2_scores):.4f} ± {np.std(cv_r2_scores):.4f}")
+        
+        print(f"\nTotal Analysis Duration: {results['duration']}")
+        print(f"📁 All outputs saved to: {lstm_model.output_dir}")
+    else:
+        print("❌ Analysis failed. Check logs for details.")
