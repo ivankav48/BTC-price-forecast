@@ -1,0 +1,1260 @@
+import pandas as pd
+import numpy as np
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader, TensorDataset
+from sklearn.preprocessing import MinMaxScaler, StandardScaler, RobustScaler
+from sklearn.model_selection import TimeSeriesSplit, RandomizedSearchCV
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+import xgboost as xgb
+from sklearn.feature_selection import SelectKBest, f_regression
+from boruta import BorutaPy
+from sklearn.ensemble import RandomForestRegressor
+import matplotlib.pyplot as plt
+import seaborn as sns
+import warnings
+import glob
+import os
+from scipy import stats
+from scipy.stats import jarque_bera, shapiro, kstest, normaltest
+from scipy.stats import pearsonr, spearmanr
+import optuna
+
+# Handle different package versions gracefully
+try:
+    from statsmodels.stats.diagnostic import acorr_ljungbox
+    from statsmodels.tsa.stattools import adfuller
+    STATSMODELS_AVAILABLE = True
+except ImportError:
+    print("⚠️ Warning: statsmodels not available. Some statistical tests will be skipped.")
+    STATSMODELS_AVAILABLE = False
+
+try:
+    from arch.unitroot import PhillipsPerron
+    ARCH_AVAILABLE = True
+except ImportError:
+    print("⚠️ Warning: arch package not available. Phillips-Perron test will be skipped.")
+    ARCH_AVAILABLE = False
+
+try:
+    import plotly.graph_objects as go
+    from plotly.subplots import make_subplots
+    import plotly.express as px
+    PLOTLY_AVAILABLE = True
+except ImportError:
+    print("⚠️ Warning: plotly not available. Interactive plots will be skipped.")
+    PLOTLY_AVAILABLE = False
+class EnhancedModelImprovement:
+    """
+    Enhanced Bitcoin prediction models with advanced optimization, statistical tests, and visualization
+    """
+    
+    def __init__(self, data_path):
+        self.data_path = data_path
+        self.df = None
+        self.scaler = MinMaxScaler()
+        self.feature_scaler = RobustScaler()
+        
+        # Test XGBoost compatibility on initialization
+        self._test_xgboost_compatibility()
+        
+    def _test_xgboost_compatibility(self):
+        """Test XGBoost training compatibility"""
+        try:
+            print("🔍 Testing XGBoost compatibility...")
+            
+            # Create simple test data
+            X_test = np.random.random((100, 5))
+            y_test = np.random.random(100)
+            
+            # Test basic XGBoost model
+            model = xgb.XGBRegressor(n_estimators=10, random_state=42, verbosity=0)
+            
+            # Try training with our helper function
+            self._train_xgboost_model(model, X_test[:80], y_test[:80], X_test[80:], y_test[80:], verbose=True)
+            
+            print("✅ XGBoost compatibility test passed!")
+            
+        except Exception as e:
+            print(f"⚠️ XGBoost compatibility test failed: {str(e)}")
+            print("   The model will attempt to work around this during training.")
+    
+    def load_and_fix_data(self):
+        """Load and fix your Bitcoin data with proper preprocessing"""
+        
+        try:
+            self.df = pd.read_csv(self.data_path, sep=';')
+            print(f"✅ Successfully loaded: {self.data_path}")
+        except FileNotFoundError:
+            print(f"❌ File not found: {self.data_path}")
+            print("\n🔎 Searching for similar files with 'Bitcoin*.csv'...")
+            candidates = glob.glob("Bitcoin*.csv")
+            if candidates:
+                print("📝 Found the following possible files:")
+                for i, file in enumerate(candidates, 1):
+                    print(f"  {i}. {file}")
+                
+                filename = candidates[0]
+                print(f"\n✅ Choosing: {filename}")
+                self.data_path = filename
+                self.df = pd.read_csv(filename, sep=';')
+            else:
+                print("⚠️ No similar files found. Terminating execution.")
+                print("📂 Directory contents:")
+                print(os.listdir('.'))
+                return None
+        
+        # Fix column names and data types
+        self.df.columns = self.df.columns.str.strip().str.replace('"', '')
+        
+        # Parse datetime properly
+        self.df['timeOpen'] = pd.to_datetime(self.df['timeOpen'].str.replace('"', ''))
+        self.df = self.df.sort_values('timeOpen').reset_index(drop=True)
+        
+        # Fix numeric columns
+        numeric_cols = ['open', 'high', 'low', 'close', 'volume', 'marketCap']
+        for col in numeric_cols:
+            if col in self.df.columns:
+                self.df[col] = pd.to_numeric(self.df[col], errors='coerce')
+        
+        # Handle missing values
+        self.df = self.df.dropna(subset=['open', 'high', 'low', 'close'])
+        
+        # Fill missing volume with 0 if necessary
+        if 'volume' in self.df.columns:
+            self.df['volume'] = self.df['volume'].fillna(0)
+        else:
+            self.df['volume'] = 0
+            
+        if 'marketCap' in self.df.columns:
+            self.df['marketCap'] = self.df['marketCap'].fillna(method='ffill')
+        else:
+            self.df['marketCap'] = 0
+        
+        print(f"Data loaded: {len(self.df)} rows from {self.df['timeOpen'].min()} to {self.df['timeOpen'].max()}")
+        return self.df
+    
+    def visualize_raw_data(self):
+        """Comprehensive raw data visualization and analysis"""
+        
+        print("📊 Creating comprehensive raw data visualizations...")
+        
+        if PLOTLY_AVAILABLE:
+            # Create comprehensive visualization
+            fig = make_subplots(
+                rows=4, cols=2,
+                subplot_titles=(
+                    'Bitcoin Price Over Time', 'Price Distribution',
+                    'Volume Over Time', 'Volume Distribution',
+                    'Daily Returns Distribution', 'Log Returns Distribution',
+                    'Price vs Volume Correlation', 'Monthly Price Patterns'
+                ),
+                specs=[[{"secondary_y": False}, {"secondary_y": False}],
+                       [{"secondary_y": False}, {"secondary_y": False}],
+                       [{"secondary_y": False}, {"secondary_y": False}],
+                       [{"secondary_y": False}, {"secondary_y": False}]],
+                vertical_spacing=0.08
+            )
+        
+            # 1. Price Over Time
+            fig.add_trace(
+                go.Scatter(x=self.df['timeOpen'], y=self.df['close'], 
+                          mode='lines', name='Close Price', line=dict(color='blue')),
+                row=1, col=1
+            )
+            
+            # 2. Price Distribution
+            fig.add_trace(
+                go.Histogram(x=self.df['close'], nbinsx=50, name='Price Distribution',
+                            marker=dict(color='lightblue', opacity=0.7)),
+                row=1, col=2
+            )
+            
+            # 3. Volume Over Time
+            if self.df['volume'].sum() > 0:
+                fig.add_trace(
+                    go.Scatter(x=self.df['timeOpen'], y=self.df['volume'], 
+                              mode='lines', name='Volume', line=dict(color='green')),
+                    row=2, col=1
+                )
+            
+            # 4. Volume Distribution
+            if self.df['volume'].sum() > 0:
+                fig.add_trace(
+                    go.Histogram(x=self.df['volume'], nbinsx=50, name='Volume Distribution',
+                                marker=dict(color='lightgreen', opacity=0.7)),
+                    row=2, col=2
+                )
+            
+            # Calculate returns
+            self.df['returns'] = self.df['close'].pct_change()
+            self.df['log_returns'] = np.log(self.df['close'] / self.df['close'].shift(1))
+            
+            # 5. Daily Returns Distribution
+            returns_clean = self.df['returns'].dropna()
+            fig.add_trace(
+                go.Histogram(x=returns_clean, nbinsx=50, name='Daily Returns',
+                            marker=dict(color='orange', opacity=0.7)),
+                row=3, col=1
+            )
+            
+            # 6. Log Returns Distribution
+            log_returns_clean = self.df['log_returns'].dropna()
+            fig.add_trace(
+                go.Histogram(x=log_returns_clean, nbinsx=50, name='Log Returns',
+                            marker=dict(color='red', opacity=0.7)),
+                row=3, col=2
+            )
+            
+            # 7. Price vs Volume Correlation (if volume data available)
+            if self.df['volume'].sum() > 0:
+                fig.add_trace(
+                    go.Scatter(x=self.df['volume'], y=self.df['close'], 
+                              mode='markers', name='Price vs Volume',
+                              marker=dict(color='purple', opacity=0.6)),
+                    row=4, col=1
+                )
+            
+            # 8. Monthly Price Patterns
+            self.df['month'] = self.df['timeOpen'].dt.month
+            monthly_avg = self.df.groupby('month')['close'].mean()
+            fig.add_trace(
+                go.Bar(x=monthly_avg.index, y=monthly_avg.values, 
+                       name='Monthly Avg Price', marker=dict(color='teal')),
+                row=4, col=2
+            )
+            
+            # Update layout
+            fig.update_layout(
+                height=1200,
+                title_text="Comprehensive Bitcoin Data Analysis",
+                showlegend=False
+            )
+            
+            fig.update_xaxes(title_text="Month", row=4, col=2)
+            
+            # Update y-axis labels
+            fig.update_yaxes(title_text="Price ($)", row=1, col=1)
+            fig.update_yaxes(title_text="Frequency", row=1, col=2)
+            fig.update_yaxes(title_text="Volume", row=2, col=1)
+            fig.update_yaxes(title_text="Frequency", row=2, col=2)
+            fig.update_yaxes(title_text="Frequency", row=3, col=1)
+            fig.update_yaxes(title_text="Frequency", row=3, col=2)
+            fig.update_yaxes(title_text="Price ($)", row=4, col=1)
+            fig.update_yaxes(title_text="Avg Price ($)", row=4, col=2)
+            
+            fig.show()
+        else:
+            print("⚠️ Plotly interactive charts skipped (plotly not available)")
+        
+        # Additional statistical analysis plots using matplotlib
+        fig2, axes = plt.subplots(2, 3, figsize=(18, 12))
+        
+        # Calculate returns if not already done
+        if 'returns' not in self.df.columns:
+            self.df['returns'] = self.df['close'].pct_change()
+        returns_clean = self.df['returns'].dropna()
+        
+        # Price trend analysis
+        axes[0, 0].plot(self.df['timeOpen'], self.df['close'], color='blue', alpha=0.7)
+        axes[0, 0].plot(self.df['timeOpen'], self.df['close'].rolling(30).mean(), 
+                       color='red', label='30-day MA')
+        axes[0, 0].plot(self.df['timeOpen'], self.df['close'].rolling(90).mean(), 
+                       color='green', label='90-day MA')
+        axes[0, 0].set_title('Bitcoin Price with Moving Averages')
+        axes[0, 0].set_ylabel('Price ($)')
+        axes[0, 0].legend()
+        axes[0, 0].grid(True, alpha=0.3)
+        
+        # Returns analysis
+        axes[0, 1].hist(returns_clean, bins=50, alpha=0.7, color='orange', density=True)
+        axes[0, 1].axvline(returns_clean.mean(), color='red', linestyle='--', 
+                          label=f'Mean: {returns_clean.mean():.4f}')
+        axes[0, 1].axvline(returns_clean.median(), color='green', linestyle='--', 
+                          label=f'Median: {returns_clean.median():.4f}')
+        axes[0, 1].set_title('Daily Returns Distribution')
+        axes[0, 1].set_xlabel('Returns')
+        axes[0, 1].set_ylabel('Density')
+        axes[0, 1].legend()
+        axes[0, 1].grid(True, alpha=0.3)
+        
+        # Q-Q plot for normality
+        from scipy.stats import probplot
+        probplot(returns_clean, dist="norm", plot=axes[0, 2])
+        axes[0, 2].set_title('Q-Q Plot: Returns vs Normal Distribution')
+        axes[0, 2].grid(True, alpha=0.3)
+        
+        # Volatility over time
+        volatility = returns_clean.rolling(window=30).std()
+        axes[1, 0].plot(self.df['timeOpen'][1:], volatility, color='purple')
+        axes[1, 0].set_title('30-Day Rolling Volatility')
+        axes[1, 0].set_ylabel('Volatility')
+        axes[1, 0].grid(True, alpha=0.3)
+        
+        # Autocorrelation of returns
+        if STATSMODELS_AVAILABLE:
+            try:
+                from statsmodels.graphics.tsaplots import plot_acf
+                plot_acf(returns_clean.dropna(), lags=40, ax=axes[1, 1], alpha=0.05)
+                axes[1, 1].set_title('Autocorrelation of Returns')
+            except ImportError:
+                axes[1, 1].text(0.5, 0.5, 'ACF plot unavailable\n(statsmodels.graphics not found)', 
+                               ha='center', va='center', transform=axes[1, 1].transAxes)
+                axes[1, 1].set_title('Autocorrelation of Returns (Unavailable)')
+        else:
+            axes[1, 1].text(0.5, 0.5, 'ACF plot unavailable\n(statsmodels not installed)', 
+                           ha='center', va='center', transform=axes[1, 1].transAxes)
+            axes[1, 1].set_title('Autocorrelation of Returns (Unavailable)')
+        
+        # Year-over-year comparison
+        self.df['year'] = self.df['timeOpen'].dt.year
+        yearly_returns = self.df.groupby('year')['close'].apply(
+            lambda x: (x.iloc[-1] / x.iloc[0] - 1) * 100 if len(x) > 1 else 0
+        )
+        axes[1, 2].bar(yearly_returns.index, yearly_returns.values, 
+                      color=['green' if x > 0 else 'red' for x in yearly_returns.values])
+        axes[1, 2].set_title('Annual Returns (%)')
+        axes[1, 2].set_ylabel('Return (%)')
+        axes[1, 2].grid(True, alpha=0.3)
+        
+        plt.tight_layout()
+        plt.show()
+        
+        # Print basic statistics
+        print("\n📈 RAW DATA STATISTICAL SUMMARY")
+        print("=" * 60)
+        print(f"Total observations: {len(self.df)}")
+        print(f"Date range: {self.df['timeOpen'].min()} to {self.df['timeOpen'].max()}")
+        print(f"Price range: ${self.df['close'].min():,.2f} - ${self.df['close'].max():,.2f}")
+        print(f"Average daily return: {returns_clean.mean():.4f} ({returns_clean.mean()*100:.2f}%)")
+        print(f"Daily volatility: {returns_clean.std():.4f} ({returns_clean.std()*100:.2f}%)")
+        print(f"Annualized volatility: {returns_clean.std() * np.sqrt(365):.4f} ({returns_clean.std() * np.sqrt(365)*100:.2f}%)")
+        print(f"Sharpe ratio (assuming 0% risk-free rate): {returns_clean.mean() / returns_clean.std():.4f}")
+        print(f"Maximum drawdown: {((self.df['close'] / self.df['close'].cummax() - 1).min())*100:.2f}%")
+    
+    def statistical_tests_for_raw_data(self):
+        """Perform statistical tests on raw data"""
+        
+        print("\n🔬 STATISTICAL TESTS FOR RAW DATA")
+        print("=" * 60)
+        
+        # Calculate returns if not already calculated
+        if 'returns' not in self.df.columns:
+            self.df['returns'] = self.df['close'].pct_change()
+        if 'log_returns' not in self.df.columns:
+            self.df['log_returns'] = np.log(self.df['close'] / self.df['close'].shift(1))
+        
+        returns = self.df['returns'].dropna()
+        log_returns = self.df['log_returns'].dropna()
+        prices = self.df['close'].values
+        
+        # 1. Normality tests
+        print("\n1. NORMALITY TESTS")
+        print("-" * 30)
+        
+        # Jarque-Bera test
+        jb_stat, jb_pvalue = jarque_bera(returns)
+        print(f"Jarque-Bera test (returns):")
+        print(f"   Statistic: {jb_stat:.4f}, p-value: {jb_pvalue:.6f}")
+        print(f"   Result: {'Normal' if jb_pvalue > 0.05 else 'Not Normal'} at 5% level")
+        
+        # Shapiro-Wilk test (for smaller samples)
+        sw_stat, sw_pvalue = None, None
+        if len(returns) <= 5000:
+            sw_stat, sw_pvalue = shapiro(returns[:5000])
+            print(f"Shapiro-Wilk test (returns, first 5000 obs):")
+            print(f"   Statistic: {sw_stat:.4f}, p-value: {sw_pvalue:.6f}")
+            print(f"   Result: {'Normal' if sw_pvalue > 0.05 else 'Not Normal'} at 5% level")
+        
+        # 2. Stationarity tests
+        print("\n2. STATIONARITY TESTS")
+        print("-" * 30)
+        
+        adf_result = adf_returns = None
+        if STATSMODELS_AVAILABLE:
+            # Augmented Dickey-Fuller test
+            adf_result = adfuller(prices, autolag='AIC')
+            print(f"ADF test (price levels):")
+            print(f"   Statistic: {adf_result[0]:.4f}, p-value: {adf_result[1]:.6f}")
+            print(f"   Result: {'Stationary' if adf_result[1] < 0.05 else 'Non-stationary'} at 5% level")
+            
+            # ADF test on returns
+            adf_returns = adfuller(returns, autolag='AIC')
+            print(f"ADF test (returns):")
+            print(f"   Statistic: {adf_returns[0]:.4f}, p-value: {adf_returns[1]:.6f}")
+            print(f"   Result: {'Stationary' if adf_returns[1] < 0.05 else 'Non-stationary'} at 5% level")
+        else:
+            print("ADF tests: Skipped (statsmodels not available)")
+        
+        # Phillips-Perron test
+        pp_result = None
+        if ARCH_AVAILABLE:
+            try:
+                pp_result = PhillipsPerron(prices)
+                print(f"Phillips-Perron test (price levels):")
+                print(f"   Statistic: {pp_result.stat:.4f}, p-value: {pp_result.pvalue:.6f}")
+                print(f"   Result: {'Stationary' if pp_result.pvalue < 0.05 else 'Non-stationary'} at 5% level")
+            except:
+                print("Phillips-Perron test: Could not compute")
+        else:
+            print("Phillips-Perron test: Skipped (arch package not available)")
+        
+        # 3. Autocorrelation tests
+        print("\n3. AUTOCORRELATION TESTS")
+        print("-" * 30)
+        
+        lb_result = None
+        if STATSMODELS_AVAILABLE:
+            # Ljung-Box test for autocorrelation
+            lb_result = acorr_ljungbox(returns, lags=10, return_df=True)
+            significant_lags = lb_result[lb_result['lb_pvalue'] < 0.05]
+            print(f"Ljung-Box test (returns, lags 1-10):")
+            if len(significant_lags) > 0:
+                print(f"   Significant autocorrelation found at lags: {list(significant_lags.index)}")
+            else:
+                print(f"   No significant autocorrelation found")
+        else:
+            print("Ljung-Box test: Skipped (statsmodels not available)")
+        
+        # 4. Heteroskedasticity tests
+        print("\n4. HETEROSKEDASTICITY TESTS")
+        print("-" * 30)
+        
+        # Simple variance ratio test
+        returns_squared = returns**2
+        first_half_var = returns_squared[:len(returns_squared)//2].var()
+        second_half_var = returns_squared[len(returns_squared)//2:].var()
+        var_ratio = second_half_var / first_half_var
+        print(f"Variance ratio test (2nd half / 1st half):")
+        print(f"   Ratio: {var_ratio:.4f}")
+        print(f"   Result: {'Heteroskedastic' if abs(var_ratio - 1) > 0.5 else 'Homoskedastic'}")
+        
+        # 5. Distribution characteristics
+        print("\n5. DISTRIBUTION CHARACTERISTICS")
+        print("-" * 30)
+        
+        from scipy.stats import skew, kurtosis
+        
+        returns_skew = skew(returns)
+        returns_kurtosis = kurtosis(returns, fisher=True)  # excess kurtosis
+        
+        print(f"Returns skewness: {returns_skew:.4f}")
+        print(f"   Result: {'Right-skewed' if returns_skew > 0 else 'Left-skewed' if returns_skew < 0 else 'Symmetric'}")
+        print(f"Returns excess kurtosis: {returns_kurtosis:.4f}")
+        print(f"   Result: {'Leptokurtic (fat tails)' if returns_kurtosis > 0 else 'Platykurtic (thin tails)' if returns_kurtosis < 0 else 'Mesokurtic (normal tails)'}")
+        
+        return {
+            'normality': {
+                'jarque_bera': (jb_stat, jb_pvalue),
+                'shapiro_wilk': (sw_stat, sw_pvalue) if sw_stat is not None else None
+            },
+            'stationarity': {
+                'adf_prices': adf_result,
+                'adf_returns': adf_returns
+            },
+            'autocorrelation': {
+                'ljung_box': lb_result
+            },
+            'distribution': {
+                'skewness': returns_skew,
+                'kurtosis': returns_kurtosis,
+                'variance_ratio': var_ratio
+            }
+        }
+    
+    def create_improved_features(self):
+        """Create improved feature set based on literature findings"""
+        
+        df = self.df.copy()
+        
+        print("Creating improved technical indicators...")
+        
+        # Moving averages with multiple timeframes
+        for window in [7, 14, 21, 50, 100, 200]:
+            df[f'sma_{window}'] = df['close'].rolling(window=window).mean()
+            df[f'price_to_sma_{window}'] = df['close'] / df[f'sma_{window}']
+        
+        # Exponential moving averages
+        for span in [12, 26, 50, 100]:
+            df[f'ema_{span}'] = df['close'].ewm(span=span).mean()
+            df[f'price_to_ema_{span}'] = df['close'] / df[f'ema_{span}']
+        
+        # Improved RSI calculation
+        def calculate_rsi(prices, window=14):
+            delta = prices.diff()
+            gain = (delta.where(delta > 0, 0)).rolling(window=window).mean()
+            loss = (-delta.where(delta < 0, 0)).rolling(window=window).mean()
+            rs = gain / loss
+            rsi = 100 - (100 / (1 + rs))
+            return rsi
+        
+        df['rsi_14'] = calculate_rsi(df['close'], 14)
+        df['rsi_21'] = calculate_rsi(df['close'], 21)
+        df['rsi_divergence'] = df['rsi_14'] - df['rsi_21']
+        
+        # MACD with proper parameters
+        ema_12 = df['close'].ewm(span=12).mean()
+        ema_26 = df['close'].ewm(span=26).mean()
+        df['macd'] = ema_12 - ema_26
+        df['macd_signal'] = df['macd'].ewm(span=9).mean()
+        df['macd_histogram'] = df['macd'] - df['macd_signal']
+        df['macd_crossover'] = (df['macd'] > df['macd_signal']).astype(int)
+        
+        # Bollinger Bands with position
+        window = 20
+        df['bb_middle'] = df['close'].rolling(window=window).mean()
+        df['bb_std'] = df['close'].rolling(window=window).std()
+        df['bb_upper'] = df['bb_middle'] + (df['bb_std'] * 2)
+        df['bb_lower'] = df['bb_middle'] - (df['bb_std'] * 2)
+        df['bb_width'] = (df['bb_upper'] - df['bb_lower']) / df['bb_middle']
+        df['bb_position'] = (df['close'] - df['bb_lower']) / (df['bb_upper'] - df['bb_lower'])
+        
+        # Volume-based features (if volume available)
+        if df['volume'].sum() > 0:
+            df['volume_sma'] = df['volume'].rolling(window=20).mean()
+            df['volume_ratio'] = df['volume'] / df['volume_sma']
+            df['price_volume'] = df['close'] * df['volume']
+            df['vwap'] = df['price_volume'].rolling(window=20).sum() / df['volume'].rolling(window=20).sum()
+            df['volume_price_correlation'] = df['volume'].rolling(window=20).corr(df['close'])
+        
+        # Volatility features
+        df['returns'] = df['close'].pct_change()
+        df['log_returns'] = np.log(df['close'] / df['close'].shift(1))
+        
+        for window in [5, 10, 20, 50]:
+            df[f'volatility_{window}'] = df['returns'].rolling(window=window).std()
+        
+        for window in [5, 10, 50]:
+            df[f'volatility_{window}_ratio'] = df[f'volatility_{window}'] / df['volatility_20']
+        
+        # Price patterns and momentum
+        df['high_low_ratio'] = df['high'] / df['low']
+        df['close_open_ratio'] = df['close'] / df['open']
+        df['intraday_range'] = (df['high'] - df['low']) / df['close']
+        df['price_position'] = (df['close'] - df['low']) / (df['high'] - df['low'])
+        
+        # Momentum indicators
+        for period in [5, 10, 20]:
+            df[f'momentum_{period}'] = df['close'] / df['close'].shift(period) - 1
+            df[f'roc_{period}'] = df['close'].pct_change(period)
+        
+        # Lag features
+        for lag in [1, 2, 3, 5, 10, 20]:
+            df[f'close_lag_{lag}'] = df['close'].shift(lag)
+            df[f'volume_lag_{lag}'] = df['volume'].shift(lag)
+            df[f'returns_lag_{lag}'] = df['returns'].shift(lag)
+        
+        # Trend and regime features
+        df['trend_5'] = (df['close'] > df['close'].rolling(5).mean()).astype(int)
+        df['trend_20'] = (df['close'] > df['close'].rolling(20).mean()).astype(int)
+        df['trend_50'] = (df['close'] > df['close'].rolling(50).mean()).astype(int)
+        
+        # Price channels
+        df['upper_channel'] = df['high'].rolling(window=20).max()
+        df['lower_channel'] = df['low'].rolling(window=20).min()
+        df['channel_position'] = (df['close'] - df['lower_channel']) / (df['upper_channel'] - df['lower_channel'])
+        
+        # Time-based features
+        df['day_of_week'] = df['timeOpen'].dt.dayofweek
+        df['month'] = df['timeOpen'].dt.month
+        df['quarter'] = df['timeOpen'].dt.quarter
+        df['is_weekend'] = (df['day_of_week'] >= 5).astype(int)
+        df['is_month_end'] = df['timeOpen'].dt.is_month_end.astype(int)
+        
+        # Statistical features
+        for window in [10, 20, 50]:
+            df[f'price_percentile_{window}'] = df['close'].rolling(window=window).rank(pct=True)
+            df[f'volume_percentile_{window}'] = df['volume'].rolling(window=window).rank(pct=True)
+        
+        # Fill missing values
+        df = df.fillna(method='ffill').fillna(method='bfill').fillna(0)
+        df = df.replace([np.inf, -np.inf], np.nan).fillna(0)
+        
+        self.df_enhanced = df
+        feature_cols = [col for col in df.columns if col not in ['timeOpen', 'timeClose', 'timeHigh', 'timeLow', 'name', 'timestamp']]
+        print(f"Enhanced features created: {len(feature_cols)} total features")
+        
+        return df
+    
+    def _train_xgboost_model(self, model, X_train, y_train, X_val=None, y_val=None, verbose=False):
+        """
+        Helper function to train XGBoost model with version compatibility
+        Handles different XGBoost versions and parameter compatibility
+        """
+        try:
+            # Method 1: Try new callback API (XGBoost >= 1.6.0)
+            if X_val is not None and y_val is not None:
+                model.fit(
+                    X_train, y_train,
+                    eval_set=[(X_val, y_val)],
+                    callbacks=[xgb.callback.EarlyStopping(rounds=50, save_best=True)],
+                    verbose=verbose
+                )
+            else:
+                model.fit(X_train, y_train, verbose=verbose)
+            
+            if verbose:
+                print("   ✅ XGBoost trained with callback API")
+            return model
+                    
+        except (TypeError, AttributeError, ValueError) as e:
+            if verbose:
+                print(f"   ⚠️ Callback API failed ({str(e)[:50]}...), trying legacy API")
+            
+            try:
+                # Method 2: Try legacy early_stopping_rounds parameter
+                if X_val is not None and y_val is not None:
+                    model.fit(
+                        X_train, y_train,
+                        eval_set=[(X_val, y_val)],
+                        early_stopping_rounds=50,
+                        verbose=verbose
+                    )
+                else:
+                    model.fit(X_train, y_train, verbose=verbose)
+                
+                if verbose:
+                    print("   ✅ XGBoost trained with legacy API")
+                return model
+                        
+            except (TypeError, AttributeError, ValueError) as e:
+                if verbose:
+                    print(f"   ⚠️ Legacy API failed ({str(e)[:50]}...), using basic training")
+                
+                try:
+                    # Method 3: Basic training without early stopping or eval_set
+                    model.fit(X_train, y_train)
+                    if verbose:
+                        print("   ✅ XGBoost trained without early stopping")
+                    return model
+                
+                except Exception as e:
+                    if verbose:
+                        print(f"   ❌ All XGBoost training methods failed: {str(e)}")
+                    raise e
+    
+    def feature_selection_analysis(self):
+        """Implement Boruta feature selection"""
+        
+        if self.df_enhanced is None:
+            raise ValueError("Must create enhanced features first")
+        
+        feature_cols = [col for col in self.df_enhanced.columns 
+                       if col not in ['timeOpen', 'timeClose', 'timeHigh', 'timeLow', 'name', 'timestamp', 'close']]
+        
+        X = self.df_enhanced[feature_cols].values
+        y = self.df_enhanced['close'].values
+        
+        mask = np.isfinite(X).all(axis=1) & np.isfinite(y)
+        X, y = X[mask], y[mask]
+        
+        print("Running Boruta feature selection...")
+        
+        rf = RandomForestRegressor(n_estimators=100, random_state=42, n_jobs=-1)
+        boruta_selector = BorutaPy(rf, n_estimators='auto', verbose=0, random_state=42)
+        
+        boruta_selector.fit(X, y)
+        
+        selected_features = np.array(feature_cols)[boruta_selector.support_]
+        tentative_features = np.array(feature_cols)[boruta_selector.support_weak_]
+        
+        print(f"Selected features: {len(selected_features)}")
+        print(f"Tentative features: {len(tentative_features)}")
+        print(f"Rejected features: {len(feature_cols) - len(selected_features) - len(tentative_features)}")
+        
+        feature_ranking = pd.DataFrame({
+            'feature': feature_cols,
+            'ranking': boruta_selector.ranking_,
+            'selected': boruta_selector.support_
+        }).sort_values('ranking')
+        
+        self.selected_features = selected_features
+        
+        return {
+            'selected_features': selected_features,
+            'tentative_features': tentative_features,
+            'feature_ranking': feature_ranking,
+            'selector': boruta_selector
+        }
+    
+    def optimize_xgboost_hyperparameters(self):
+        """Advanced XGBoost hyperparameter optimization using Optuna"""
+        
+        print("🔧 Optimizing XGBoost hyperparameters...")
+        print(f"   Using XGBoost version: {xgb.__version__}")
+        
+        if not hasattr(self, 'selected_features'):
+            self.feature_selection_analysis()
+        
+        feature_cols = self.selected_features
+        X = self.df_enhanced[feature_cols].values
+        y = self.df_enhanced['close'].values
+        
+        mask = np.isfinite(X).all(axis=1) & np.isfinite(y)
+        X, y = X[mask], y[mask]
+        
+        tscv = TimeSeriesSplit(n_splits=5)
+        
+        def objective(trial):
+            params = {
+                'n_estimators': trial.suggest_int('n_estimators', 500, 3000),
+                'max_depth': trial.suggest_int('max_depth', 3, 12),
+                'learning_rate': trial.suggest_float('learning_rate', 0.001, 0.3, log=True),
+                'subsample': trial.suggest_float('subsample', 0.6, 1.0),
+                'colsample_bytree': trial.suggest_float('colsample_bytree', 0.6, 1.0),
+                'reg_alpha': trial.suggest_float('reg_alpha', 0.0, 1.0),
+                'reg_lambda': trial.suggest_float('reg_lambda', 0.0, 1.0),
+                'min_child_weight': trial.suggest_int('min_child_weight', 1, 10),
+                'gamma': trial.suggest_float('gamma', 0.0, 0.5),
+                'objective': 'reg:squarederror',
+                'eval_metric': 'rmse',
+                'random_state': 42,
+                'n_jobs': -1
+            }
+            
+            cv_scores = []
+            
+            for train_idx, val_idx in tscv.split(X):
+                X_train_fold, X_val_fold = X[train_idx], X[val_idx]
+                y_train_fold, y_val_fold = y[train_idx], y[val_idx]
+                
+                scaler = RobustScaler()
+                X_train_scaled = scaler.fit_transform(X_train_fold)
+                X_val_scaled = scaler.transform(X_val_fold)
+                
+                model = xgb.XGBRegressor(**params)
+                self._train_xgboost_model(model, X_train_scaled, y_train_fold, X_val_scaled, y_val_fold, verbose=False)
+                
+                y_pred = model.predict(X_val_scaled)
+                score = r2_score(y_val_fold, y_pred)
+                cv_scores.append(score)
+            
+            return np.mean(cv_scores)
+        
+        study = optuna.create_study(direction='maximize', 
+                                  sampler=optuna.samplers.TPESampler(seed=42))
+        study.optimize(objective, n_trials=100, timeout=600)
+        
+        print(f"✅ Best XGBoost R² score: {study.best_value:.4f}")
+        print(f"📊 Best parameters: {study.best_params}")
+        
+        self.best_xgb_params = study.best_params
+        return study.best_params
+    
+    def improved_xgboost_with_cv(self):
+        """Improved XGBoost model with cross-validation"""
+        
+        print("🚀 Training optimized XGBoost with cross-validation...")
+        
+        if hasattr(self, 'best_xgb_params'):
+            best_params = self.best_xgb_params.copy()
+        else:
+            best_params = {
+                'n_estimators': 2000,
+                'max_depth': 8,
+                'learning_rate': 0.01,
+                'subsample': 0.8,
+                'colsample_bytree': 0.8,
+                'reg_alpha': 0.1,
+                'reg_lambda': 0.1,
+                'objective': 'reg:squarederror',
+                'eval_metric': 'rmse',
+                'random_state': 42,
+                'n_jobs': -1
+            }
+        
+        feature_cols = self.selected_features if hasattr(self, 'selected_features') else [
+            col for col in self.df_enhanced.columns 
+            if col not in ['timeOpen', 'timeClose', 'timeHigh', 'timeLow', 'name', 'timestamp', 'close']
+        ]
+        
+        X = self.df_enhanced[feature_cols].values
+        y = self.df_enhanced['close'].values
+        
+        mask = np.isfinite(X).all(axis=1) & np.isfinite(y)
+        X, y = X[mask], y[mask]
+        
+        tscv = TimeSeriesSplit(n_splits=5)
+        cv_scores = {'mae': [], 'rmse': [], 'r2': [], 'mape': []}
+        
+        print("📈 Performing time series cross-validation...")
+        
+        for fold, (train_idx, val_idx) in enumerate(tscv.split(X), 1):
+            print(f"   Fold {fold}/5", end=" ")
+            
+            X_train_fold, X_val_fold = X[train_idx], X[val_idx]
+            y_train_fold, y_val_fold = y[train_idx], y[val_idx]
+            
+            scaler = RobustScaler()
+            X_train_scaled = scaler.fit_transform(X_train_fold)
+            X_val_scaled = scaler.transform(X_val_fold)
+            
+            # Train model with version compatibility
+            model = xgb.XGBRegressor(**best_params)
+            self._train_xgboost_model(model, X_train_scaled, y_train_fold, X_val_scaled, y_val_fold)
+            
+            y_pred = model.predict(X_val_scaled)
+            
+            mae = mean_absolute_error(y_val_fold, y_pred)
+            rmse = np.sqrt(mean_squared_error(y_val_fold, y_pred))
+            r2 = r2_score(y_val_fold, y_pred)
+            mape = np.mean(np.abs((y_val_fold - y_pred) / y_val_fold)) * 100
+            
+            cv_scores['mae'].append(mae)
+            cv_scores['rmse'].append(rmse)
+            cv_scores['r2'].append(r2)
+            cv_scores['mape'].append(mape)
+            
+            print(f"- R²: {r2:.4f}")
+        
+        # Final model on full training data
+        split_idx = int(len(X) * 0.8)
+        X_train, X_test = X[:split_idx], X[split_idx:]
+        y_train, y_test = y[:split_idx], y[split_idx:]
+        
+        X_train_scaled = self.feature_scaler.fit_transform(X_train)
+        X_test_scaled = self.feature_scaler.transform(X_test)
+        
+        final_model = xgb.XGBRegressor(**best_params)
+        self._train_xgboost_model(final_model, X_train_scaled, y_train, X_test_scaled, y_test, verbose=False)
+        
+        y_pred = final_model.predict(X_test_scaled)
+        
+        mae = mean_absolute_error(y_test, y_pred)
+        rmse = np.sqrt(mean_squared_error(y_test, y_pred))
+        r2 = r2_score(y_test, y_pred)
+        mape = np.mean(np.abs((y_test - y_pred) / y_test)) * 100
+        
+        feature_importance = pd.DataFrame({
+            'feature': feature_cols,
+            'importance': final_model.feature_importances_
+        }).sort_values('importance', ascending=False)
+        
+        results = {
+            'model': final_model,
+            'mae': mae,
+            'rmse': rmse,
+            'r2': r2,
+            'mape': mape,
+            'y_true': y_test,
+            'y_pred': y_pred,
+            'feature_importance': feature_importance,
+            'cv_scores': cv_scores,
+            'cv_mean': {metric: np.mean(scores) for metric, scores in cv_scores.items()},
+            'cv_std': {metric: np.std(scores) for metric, scores in cv_scores.items()}
+        }
+        
+        print(f"\n✅ Final XGBoost Results:")
+        print(f"   MAE: ${mae:,.2f}")
+        print(f"   RMSE: ${rmse:,.2f}")
+        print(f"   R²: {r2:.4f}")
+        print(f"   MAPE: {mape:.2f}%")
+        print(f"\n📊 Cross-validation averages:")
+        print(f"   R²: {results['cv_mean']['r2']:.4f} ± {results['cv_std']['r2']:.4f}")
+        print(f"   MAPE: {results['cv_mean']['mape']:.2f}% ± {results['cv_std']['mape']:.2f}%")
+        
+        return results
+    
+    def statistical_tests_for_predictions(self, xgb_results):
+        """Statistical tests for XGBoost model validation"""
+        
+        print("\n🔬 STATISTICAL TESTS FOR MODEL PREDICTIONS")
+        print("=" * 70)
+        
+        y_true = xgb_results['y_true']
+        y_pred = xgb_results['y_pred']
+        
+        # 1. Residual Analysis
+        print("\n1. RESIDUAL ANALYSIS")
+        print("-" * 40)
+        
+        residuals = y_true - y_pred
+        
+        print(f"XGBoost Residuals:")
+        
+        # Normality tests
+        jb_stat, jb_p = jarque_bera(residuals)
+        print(f"  Jarque-Bera normality test: stat={jb_stat:.4f}, p-value={jb_p:.6f}")
+        print(f"    Result: {'Normal' if jb_p > 0.05 else 'Not normal'} at 5% level")
+        
+        # Zero mean test
+        t_stat, t_p = stats.ttest_1samp(residuals, 0)
+        print(f"  Zero mean test: t-stat={t_stat:.4f}, p-value={t_p:.6f}")
+        print(f"    Result: {'Mean not significantly different from 0' if t_p > 0.05 else 'Mean significantly different from 0'}")
+        
+        # Heteroskedasticity test (Breusch-Pagan approximation)
+        residuals_abs = np.abs(residuals)
+        correlation, corr_p = pearsonr(y_pred, residuals_abs)
+        print(f"  Heteroskedasticity test: correlation={correlation:.4f}, p-value={corr_p:.6f}")
+        print(f"    Result: {'Homoskedastic' if corr_p > 0.05 else 'Heteroskedastic'}")
+        
+        # Autocorrelation test
+        if len(residuals) > 10 and STATSMODELS_AVAILABLE:
+            try:
+                lb_result = acorr_ljungbox(residuals, lags=min(10, len(residuals)//4), return_df=True)
+                significant_autocorr = (lb_result['lb_pvalue'] < 0.05).any()
+                print(f"  Autocorrelation test: {'Significant autocorrelation detected' if significant_autocorr else 'No significant autocorrelation'}")
+            except:
+                print(f"  Autocorrelation test: Could not compute")
+        else:
+            print(f"  Autocorrelation test: Skipped (insufficient data or statsmodels unavailable)")
+        
+        # 2. Prediction Interval Analysis
+        print("\n2. PREDICTION INTERVAL ANALYSIS")
+        print("-" * 40)
+        
+        residual_std = np.std(residuals)
+        
+        # Calculate coverage for different confidence levels
+        for confidence in [0.68, 0.95, 0.99]:
+            z_score = stats.norm.ppf(1 - (1 - confidence) / 2)
+            lower_bound = y_pred - z_score * residual_std
+            upper_bound = y_pred + z_score * residual_std
+            
+            coverage = np.mean((y_true >= lower_bound) & (y_true <= upper_bound))
+            print(f"  XGBoost {confidence*100:.0f}% PI Coverage: {coverage*100:.2f}% (Expected: {confidence*100:.0f}%)")
+        
+        # 3. Directional Accuracy
+        print("\n3. DIRECTIONAL ACCURACY")
+        print("-" * 40)
+        
+        # Calculate actual direction changes (up/down)
+        actual_direction = np.diff(y_true) > 0
+        pred_direction = np.diff(y_pred) > 0
+        
+        if len(actual_direction) == len(pred_direction):
+            directional_accuracy = np.mean(actual_direction == pred_direction)
+            print(f"  XGBoost Directional Accuracy: {directional_accuracy*100:.2f}%")
+            
+            # Statistical test for directional accuracy
+            correct_predictions = np.sum(actual_direction == pred_direction)
+            total_predictions = len(actual_direction)
+            
+            # Binomial test (H0: accuracy = 0.5)
+            binom_p = 2 * min(stats.binom.cdf(correct_predictions, total_predictions, 0.5),
+                            1 - stats.binom.cdf(correct_predictions, total_predictions, 0.5))
+            
+            print(f"    Binomial test p-value: {binom_p:.6f}")
+            print(f"    Result: {'Significantly better than random' if binom_p < 0.05 and directional_accuracy > 0.5 else 'Not significantly better than random'}")
+        
+        # 4. Model Stability Tests
+        print("\n4. MODEL STABILITY TESTS")
+        print("-" * 40)
+        
+        # Split test period into halves and compare performance
+        mid_point = len(y_true) // 2
+        
+        r2_first_half = r2_score(y_true[:mid_point], y_pred[:mid_point])
+        r2_second_half = r2_score(y_true[mid_point:], y_pred[mid_point:])
+        
+        stability_ratio = r2_second_half / r2_first_half if r2_first_half != 0 else np.inf
+        
+        print(f"  XGBoost Stability:")
+        print(f"    First half R²: {r2_first_half:.4f}")
+        print(f"    Second half R²: {r2_second_half:.4f}")
+        print(f"    Stability ratio: {stability_ratio:.4f}")
+        print(f"    Result: {'Stable' if 0.8 <= stability_ratio <= 1.2 else 'Unstable'}")
+        
+        return {
+            'residual_analysis': residuals,
+            'directional_accuracy': directional_accuracy if len(actual_direction) == len(pred_direction) else None,
+            'stability_ratio': stability_ratio
+        }
+    
+    def plot_enhanced_comparison(self, xgb_results):
+        """Enhanced plotting for XGBoost model only"""
+        
+        fig, axes = plt.subplots(2, 3, figsize=(18, 12))
+        
+        y_true = xgb_results['y_true']
+        y_pred = xgb_results['y_pred']
+        residuals = y_true - y_pred
+        
+        # 1. Scatter plot - True vs Predicted
+        axes[0, 0].scatter(y_true, y_pred, alpha=0.6, color='blue', s=20)
+        axes[0, 0].plot([y_true.min(), y_true.max()], [y_true.min(), y_true.max()], 'r--', lw=2)
+        axes[0, 0].set_title(f'XGBoost - R²: {r2_score(y_true, y_pred):.4f}')
+        axes[0, 0].set_xlabel('True Price ($)')
+        axes[0, 0].set_ylabel('Predicted Price ($)')
+        axes[0, 0].grid(True, alpha=0.3)
+        
+        # 2. Residuals vs Predicted
+        axes[0, 1].scatter(y_pred, residuals, alpha=0.6, color='blue', s=20)
+        axes[0, 1].axhline(y=0, color='red', linestyle='--')
+        axes[0, 1].set_title('XGBoost Residuals')
+        axes[0, 1].set_xlabel('Predicted Price ($)')
+        axes[0, 1].set_ylabel('Residuals ($)')
+        axes[0, 1].grid(True, alpha=0.3)
+        
+        # 3. Residual distribution
+        axes[0, 2].hist(residuals, bins=30, alpha=0.7, color='blue', density=True)
+        axes[0, 2].set_title('Residual Distribution')
+        axes[0, 2].set_xlabel('Residuals ($)')
+        axes[0, 2].set_ylabel('Density')
+        axes[0, 2].grid(True, alpha=0.3)
+        
+        # 4. Time series plot (last 100 points)
+        plot_len = min(100, len(y_true))
+        time_index = range(len(y_true) - plot_len, len(y_true))
+        
+        axes[1, 0].plot(time_index, y_true[-plot_len:], 'black', label='True', linewidth=2)
+        axes[1, 0].plot(time_index, y_pred[-plot_len:], 'blue', label='Predicted', linewidth=2, alpha=0.8)
+        axes[1, 0].set_title(f'XGBoost Predictions (Last {plot_len} points)')
+        axes[1, 0].set_xlabel('Time Index')
+        axes[1, 0].set_ylabel('Price ($)')
+        axes[1, 0].legend()
+        axes[1, 0].grid(True, alpha=0.3)
+        
+        # 5. Error metrics visualization
+        mae = mean_absolute_error(y_true, y_pred)
+        rmse = np.sqrt(mean_squared_error(y_true, y_pred))
+        mape = np.mean(np.abs((y_true - y_pred) / y_true)) * 100
+        
+        metrics = ['MAE', 'RMSE', 'MAPE']
+        values = [mae, rmse, mape]
+        
+        bars = axes[1, 1].bar(metrics, values, color='blue', alpha=0.7)
+        axes[1, 1].set_title('Error Metrics')
+        axes[1, 1].set_ylabel('Error Value')
+        axes[1, 1].grid(True, alpha=0.3)
+        
+        for bar, value in zip(bars, values):
+            axes[1, 1].text(bar.get_x() + bar.get_width()/2, bar.get_height() + max(values)*0.01,
+                           f'{value:.2f}', ha='center', va='bottom')
+        
+        # 6. Feature importance (top 10)
+        if 'feature_importance' in xgb_results:
+            top_features = xgb_results['feature_importance'].head(10)
+            axes[1, 2].barh(range(len(top_features)), top_features['importance'], color='blue', alpha=0.7)
+            axes[1, 2].set_yticks(range(len(top_features)))
+            axes[1, 2].set_yticklabels(top_features['feature'])
+            axes[1, 2].set_title('Top 10 Feature Importance')
+            axes[1, 2].set_xlabel('Importance Score')
+            axes[1, 2].grid(True, alpha=0.3)
+        
+        plt.tight_layout()
+        plt.show()
+        
+        # Additional interactive plot with Plotly (if available)
+        if PLOTLY_AVAILABLE:
+            self.create_interactive_prediction_plot(xgb_results)
+        else:
+            print("⚠️ Interactive Plotly charts skipped (plotly not available)")
+    
+    def create_interactive_prediction_plot(self, xgb_results):
+        """Create interactive Plotly visualization for XGBoost"""
+        
+        if not PLOTLY_AVAILABLE:
+            print("⚠️ Interactive plots require plotly package")
+            return
+        
+        fig = make_subplots(
+            rows=2, cols=2,
+            subplot_titles=('XGBoost Predictions', 'Residual Analysis',
+                          'Error Distribution', 'Cumulative Returns'),
+            specs=[[{"secondary_y": False}, {"secondary_y": False}],
+                   [{"secondary_y": False}, {"secondary_y": False}]]
+        )
+        
+        y_true = xgb_results['y_true']
+        y_pred = xgb_results['y_pred']
+        residuals = y_true - y_pred
+        
+        # 1. Time series comparison (last 200 points for clarity)
+        plot_len = min(200, len(y_true))
+        start_idx = len(y_true) - plot_len
+        time_index = list(range(start_idx, len(y_true)))
+        
+        fig.add_trace(
+            go.Scatter(x=time_index, y=y_true[start_idx:], 
+                      mode='lines', name='True Price', line=dict(color='black', width=3)),
+            row=1, col=1
+        )
+        
+        fig.add_trace(
+            go.Scatter(x=time_index, y=y_pred[start_idx:], 
+                      mode='lines', name='XGBoost Prediction',
+                      line=dict(color='blue', width=2)),
+            row=1, col=1
+        )
+        
+        # 2. Residual analysis
+        fig.add_trace(
+            go.Scatter(x=y_pred, y=residuals, mode='markers',
+                      name='Residuals',
+                      marker=dict(color='blue', size=4, opacity=0.6)),
+            row=1, col=2
+        )
+        
+        # Add zero line for residuals
+        fig.add_trace(
+            go.Scatter(x=[y_pred.min(), y_pred.max()], y=[0, 0],
+                      mode='lines', name='Zero Line',
+                      line=dict(color='red', dash='dash'), showlegend=False),
+            row=1, col=2
+        )
+        
+        # 3. Error distribution
+        fig.add_trace(
+            go.Histogram(x=np.abs(residuals), name='Absolute Error',
+                       marker=dict(color='blue', opacity=0.7),
+                       nbinsx=30),
+            row=2, col=1
+        )
+        
+        # 4. Cumulative returns comparison
+        returns_true = np.diff(y_true) / y_true[:-1]
+        returns_pred = np.diff(y_pred) / y_pred[:-1]
+        cum_returns_true = np.cumprod(1 + returns_true)
+        cum_returns_pred = np.cumprod(1 + returns_pred)
+        
+        fig.add_trace(
+            go.Scatter(x=list(range(len(cum_returns_true))), y=cum_returns_true,
+                      mode='lines', name='True Cumulative Returns',
+                      line=dict(color='black', width=3)),
+            row=2, col=2
+        )
+        
+        fig.add_trace(
+            go.Scatter(x=list(range(len(cum_returns_pred))), y=cum_returns_pred,
+                      mode='lines', name='Predicted Cumulative Returns',
+                      line=dict(color='blue', width=2)),
+            row=2, col=2
+        )
+        
+        # Update layout
+        fig.update_layout(
+            height=800,
+            title_text="XGBoost Model Analysis",
+            showlegend=True
+        )
+        
+        # Update axes labels
+        fig.update_xaxes(title_text="Time Index", row=1, col=1)
+        fig.update_yaxes(title_text="Price ($)", row=1, col=1)
+        
+        fig.update_xaxes(title_text="Predicted Price ($)", row=1, col=2)
+        fig.update_yaxes(title_text="Residuals ($)", row=1, col=2)
+        
+        fig.update_xaxes(title_text="Absolute Error ($)", row=2, col=1)
+        fig.update_yaxes(title_text="Frequency", row=2, col=1)
+        
+        fig.update_xaxes(title_text="Time Index", row=2, col=2)
+        fig.update_yaxes(title_text="Cumulative Returns", row=2, col=2)
+        
+        fig.show()
+    
+    def run_enhanced_improvement(self):
+        """Run complete enhanced improvement pipeline with statistical tests and visualizations"""
+        
+        print("🚀 Running Enhanced Model Improvement Pipeline")
+        print("=" * 70)
+        
+        try:
+            # 1. Load and fix data
+            print("\n1. Loading and preprocessing data...")
+            data_result = self.load_and_fix_data()
+            if data_result is None:
+                print("⛔ Cannot continue without valid data.")
+                return None
+            
+            # 2. Raw data visualization and statistical analysis
+            print("\n2. Analyzing and visualizing raw data...")
+            self.visualize_raw_data()
+            raw_data_tests = self.statistical_tests_for_raw_data()
+            
+            # 3. Create enhanced features
+            print("\n3. Creating enhanced features...")
+            self.create_improved_features()
+            
+            # 4. Feature selection analysis
+            print("\n4. Running feature selection analysis...")
+            feature_selection = self.feature_selection_analysis()
+            
+            # 5. Optimize XGBoost hyperparameters
+            print("\n5. Optimizing XGBoost hyperparameters...")
+            try:
+                best_params = self.optimize_xgboost_hyperparameters()
+            except Exception as e:
+                print(f"⚠️ Hyperparameter optimization failed: {e}")
+                print("📈 Continuing with default parameters...")
+            
+            # 6. Train improved XGBoost with CV
+            print("\n6. Training optimized XGBoost with cross-validation...")
+            xgb_results = self.improved_xgboost_with_cv()
+            
+            # 7. Statistical tests for model validation
+            print("\n7. Running statistical tests for model validation...")
+            prediction_tests = self.statistical_tests_for_predictions(xgb_results)
+            
+            # 8. Enhanced visualizations
+            print("\n8. Generating enhanced comparison plots...")
+            self.plot_enhanced_comparison(xgb_results)
+            
+            # 9. Enhanced summary
+            print("\n🎯 ENHANCED IMPROVEMENT RESULTS SUMMARY")
+            print("=" * 70)
+            print(f"{'Model':<15} {'MAE':<12} {'RMSE':<12} {'R²':<8} {'MAPE':<8}")
+            print("-" * 70)
+            print(f"{'XGBoost':<15} ${xgb_results['mae']:<11,.0f} ${xgb_results['rmse']:<11,.0f} {xgb_results['r2']:<7.4f} {xgb_results['mape']:<7.2f}%")
+            
+            # Cross-validation summary
+            if 'cv_mean' in xgb_results:
+                print(f"\n📊 XGBoost Cross-Validation Results:")
+                print(f"   Mean R²: {xgb_results['cv_mean']['r2']:.4f} ± {xgb_results['cv_std']['r2']:.4f}")
+                print(f"   Mean MAPE: {xgb_results['cv_mean']['mape']:.2f}% ± {xgb_results['cv_std']['mape']:.2f}%")
+            
+            # Top features
+            print(f"\n🔍 TOP 10 MOST IMPORTANT FEATURES:")
+            print("-" * 50)
+            for i, (_, row) in enumerate(xgb_results['feature_importance'].head(10).iterrows(), 1):
+                print(f"{i:2d}. {row['feature']:<30} {row['importance']:.4f}")
+            
+            # Statistical test summary
+            print(f"\n🔬 STATISTICAL TEST SUMMARY:")
+            print("-" * 50)
+            
+            if 'directional_accuracy' in prediction_tests and prediction_tests['directional_accuracy'] is not None:
+                print(f"Directional Accuracy: {prediction_tests['directional_accuracy']*100:.2f}%")
+            
+            print(f"Model Stability Ratio: {prediction_tests['stability_ratio']:.4f}")
+            
+            return {
+                'xgb_results': xgb_results,
+                'feature_selection': feature_selection,
+                'raw_data_tests': raw_data_tests,
+                'prediction_tests': prediction_tests
+            }
+            
+        except Exception as e:
+            print(f"\n❌ Error in pipeline: {str(e)}")
+            import traceback
+            print(f"Full traceback:\n{traceback.format_exc()}")
+            return None
+
+# Usage example
+if __name__ == "__main__":
+    print("🚀 Enhanced Bitcoin Prediction Model - XGBoost Only")
+    print("=" * 60)
+    print("📦 Required packages: pandas, numpy, sklearn, xgboost, boruta, matplotlib, seaborn, scipy, optuna")
+    print("📦 Optional packages: statsmodels, arch, plotly (for enhanced features)")
+    print("=" * 60)
+    
+    try:
+        # Initialize the enhanced improvement system
+        improver = EnhancedModelImprovement("Bitcoin_12.2013_05.2025.csv")
+        
+        # Run complete enhanced improvement pipeline
+        results = improver.run_enhanced_improvement()
+        
+        print("\n🎉 Analysis completed successfully!")
+        
+    except Exception as e:
+        print(f"\n❌ Error occurred: {str(e)}")
+        print("\n🔧 Troubleshooting tips:")
+        print("1. Make sure your CSV file path is correct")
+        print("2. Check that all required packages are installed")
+        print("3. Ensure your data file has the expected format")
+        print("4. Try with a smaller dataset if memory issues occur")
+        import traceback
+        print(f"\nFull error traceback:\n{traceback.format_exc()}")
